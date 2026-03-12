@@ -1,0 +1,17 @@
+example
+example_output
+input
+main.o
+myprog
+output
+ve
+zlib
+*.o
+pmsms2mzml
+
+# Ignore all files in tests/
+tests/*
+
+# Re-allow files that have an extension
+!tests/*.*
+pmsms2tdf
