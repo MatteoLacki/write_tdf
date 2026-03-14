@@ -16,7 +16,7 @@ sumI = np.fromfile(meta / "4.bin", dtype=np.uint64)
 con = sqlite3.connect(dot_d / "analysis.tdf")
 cur = con.cursor()
 cur.executemany(
-    "UPDATE Frames SET TimsId=?, NumPeaks=?, MaxIntensity=?, SummedIntensities=? WHERE Id=?",
+    "UPDATE Frames SET TimsId=?, NumPeaks=?, MaxIntensity=?, SummedIntensities=?, AccumulationTime=100.0 WHERE Id=?",
     zip(tids.tolist(), npks.tolist(), maxI.tolist(), sumI.tolist(), ids.tolist()),
 )
 con.commit()
