@@ -1,48 +1,52 @@
 #pragma once
-#include "mmappet.h"
 #include <zstd.h>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <memory>
-#include <optional>
 #include <span>
 #include <vector>
 #include <iostream>
 #include <print>
-
-using FrameMetaWriter = DatasetWriter<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>;
+#include <cassert>
 
 class TdfWriter {
 public:
     // total_scans: instrument scan count, fixed for the whole acquisition.
     // Must be known upfront because it determines the peak_cnts header size
     // written into every frame block.
-    TdfWriter(const std::filesystem::path& output_dir,
+    //
+    // The five out_* spans must each have length == number of frames this
+    // writer will write. Metadata is stored directly into those spans;
+    // the caller owns the backing storage and writes the mmappet after all
+    // threads have finished.
+    TdfWriter(const std::filesystem::path& tdf_bin_path,
               uint32_t total_scans,
+              std::span<uint32_t> out_ids,
+              std::span<uint64_t> out_tims_ids,
+              std::span<uint32_t> out_num_peaks,
+              std::span<uint32_t> out_max_ints,
+              std::span<uint64_t> out_sum_ints,
               bool verbose = false,
-              int zstd_level = 1)
+              int  zstd_level = 1)
         : total_scans_(total_scans)
         , verbose_(verbose)
         , zstd_level_(zstd_level)
-        , output_tdf_bin_(output_dir / "analysis.tdf_bin")
+        , out_ids_(out_ids)
+        , out_tims_ids_(out_tims_ids)
+        , out_num_peaks_(out_num_peaks)
+        , out_max_ints_(out_max_ints)
+        , out_sum_ints_(out_sum_ints)
         , tdf_bin_(nullptr, fclose)
-        , meta_writer_(std::nullopt)
         , peak_cnts_(total_scans)
     {
-        std::filesystem::create_directories(output_dir);
-        tdf_bin_.reset(fopen(output_tdf_bin_.c_str(), "wb"));
+        std::filesystem::create_directories(tdf_bin_path.parent_path());
+        tdf_bin_.reset(fopen(tdf_bin_path.c_str(), "wb"));
         if (!tdf_bin_) {
-            throw std::runtime_error("Failed to open output file: " + output_tdf_bin_.string());
+            throw std::runtime_error("Failed to open output file: " + tdf_bin_path.string());
         }
-        meta_writer_.emplace(
-            Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
-                "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
-            ).create_writer(output_dir / "frames_metadata.mmappet")
-        );
     }
 
-    // Non-copyable (owns FILE* and mmappet writer)
+    // Non-copyable (owns FILE*)
     TdfWriter(const TdfWriter&) = delete;
     TdfWriter& operator=(const TdfWriter&) = delete;
 
@@ -137,7 +141,12 @@ public:
         fwrite(&total_scans_, 4, 1, tdf_bin_.get());
         fwrite(compress_buf_.data(), 1, comp_size, tdf_bin_.get());
 
-        meta_writer_->write_row(frame_id, tims_id, (uint32_t)n_events, max_int, sum_int);
+        // Store metadata into caller-owned spans
+        out_ids_[frames_written_]       = frame_id;
+        out_tims_ids_[frames_written_]  = tims_id;
+        out_num_peaks_[frames_written_] = (uint32_t)n_events;
+        out_max_ints_[frames_written_]  = max_int;
+        out_sum_ints_[frames_written_]  = sum_int;
 
         if (verbose_) {
             std::print("frame {}  n_events={}  tims_id={}  max_int={}  sum_int={}\n",
@@ -154,9 +163,15 @@ private:
     uint32_t total_scans_;
     bool verbose_;
     int zstd_level_;
-    std::filesystem::path output_tdf_bin_;
+
+    // Caller-owned metadata spans (one slot per frame this writer handles)
+    std::span<uint32_t> out_ids_;
+    std::span<uint64_t> out_tims_ids_;
+    std::span<uint32_t> out_num_peaks_;
+    std::span<uint32_t> out_max_ints_;
+    std::span<uint64_t> out_sum_ints_;
+
     std::unique_ptr<FILE, decltype(&fclose)> tdf_bin_;
-    std::optional<FrameMetaWriter> meta_writer_;
 
     // Reusable scratch buffers — grow as needed, never shrink
     std::vector<uint32_t> peak_cnts_;

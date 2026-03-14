@@ -10,9 +10,6 @@
 #include <string_view>
 #include <thread>
 #include <atomic>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
 
 // ---------------------------------------------------------------------------
@@ -249,57 +246,6 @@ static bool append_file(FILE* dst, const std::filesystem::path& src) {
     return true;
 }
 
-// Add `byte_offset` to every uint64_t in `meta_dir/1.bin` (the TimsId column).
-static bool fixup_tims_ids(const std::filesystem::path& meta_dir, uint64_t byte_offset) {
-    if (byte_offset == 0) return true;
-    auto path = meta_dir / "1.bin";
-    int fd = open(path.c_str(), O_RDWR);
-    if (fd < 0) {
-        std::cerr << "fixup_tims_ids: open failed: " << path << "\n";
-        return false;
-    }
-    struct stat st;
-    fstat(fd, &st);
-    size_t sz = (size_t)st.st_size;
-    if (sz == 0) { close(fd); return true; }
-    void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (p == MAP_FAILED) {
-        std::cerr << "fixup_tims_ids: mmap failed\n";
-        return false;
-    }
-    auto* data = static_cast<uint64_t*>(p);
-    size_t count = sz / sizeof(uint64_t);
-    for (size_t i = 0; i < count; ++i)
-        data[i] += byte_offset;
-    msync(p, sz, MS_SYNC);
-    munmap(p, sz);
-    return true;
-}
-
-// Concatenate `chunk_meta_dirs[k]/col_idx.bin` into `dst_dir/col_idx.bin`.
-static bool merge_column(const std::filesystem::path& dst_dir,
-                         int col_idx,
-                         const std::vector<std::filesystem::path>& chunk_meta_dirs)
-{
-    auto dst_path = dst_dir / (std::to_string(col_idx) + ".bin");
-    FILE* out = fopen(dst_path.c_str(), "wb");
-    if (!out) {
-        std::cerr << "merge_column: cannot create " << dst_path << "\n";
-        return false;
-    }
-    for (const auto& src_dir : chunk_meta_dirs) {
-        auto src_path = src_dir / (std::to_string(col_idx) + ".bin");
-        if (!append_file(out, src_path)) {
-            fclose(out);
-            return false;
-        }
-    }
-    fclose(out);
-    return true;
-}
-
-
 // ---------------------------------------------------------------------------
 // Write mode
 // ---------------------------------------------------------------------------
@@ -318,30 +264,47 @@ static int write_tdf(
     size_t threads,
     int zstd_level)
 {
-    size_t n_frames = frame_index.size();
+    size_t n_frames  = frame_index.size();
     size_t n_threads = std::min(threads, n_frames > 0 ? n_frames : size_t(1));
 
-    // Build chunk directories and per-thread frame slices.
-    std::vector<std::filesystem::path> chunk_dirs(n_threads);
+    // Allocate metadata arrays upfront (one entry per frame, indexed 0..n_frames-1).
+    std::vector<uint32_t> ids(n_frames), num_peaks(n_frames), max_ints(n_frames);
+    std::vector<uint64_t> tims_ids(n_frames), sum_ints(n_frames);
+
+    // Per-thread slice boundaries and binary paths.
     std::vector<size_t> slice_starts(n_threads + 1);
+    std::vector<std::filesystem::path> bin_paths(n_threads);
     for (size_t k = 0; k < n_threads; ++k) {
-        chunk_dirs[k] = output_dir / ("_tmp_" + std::to_string(k));
         slice_starts[k] = k * n_frames / n_threads;
+        if (n_threads == 1) {
+            std::filesystem::create_directories(output_dir);
+            bin_paths[k] = output_dir / "analysis.tdf_bin";
+        } else {
+            auto tmp_dir = output_dir / ("_tmp_" + std::to_string(k));
+            std::filesystem::create_directories(tmp_dir);
+            bin_paths[k] = tmp_dir / "analysis.tdf_bin";
+        }
     }
     slice_starts[n_threads] = n_frames;
 
-    // Launch threads — each writes its slice to its own chunk dir.
+    // Launch threads — each writes its slice to its own binary file and
+    // stores metadata directly into the pre-allocated vectors.
     std::atomic<bool> had_error{false};
-    std::vector<size_t> frames_written(n_threads, 0);
     {
         std::vector<std::thread> workers;
         workers.reserve(n_threads);
         for (size_t k = 0; k < n_threads; ++k) {
             workers.emplace_back([&, k]() {
-                // verbose only when single-threaded (avoids interleaved output)
-                TdfWriter writer(chunk_dirs[k], total_scans, verbose && n_threads == 1, zstd_level);
                 size_t beg = slice_starts[k];
                 size_t end = slice_starts[k + 1];
+                TdfWriter writer(
+                    bin_paths[k], total_scans,
+                    {ids.data()       + beg, end - beg},
+                    {tims_ids.data()  + beg, end - beg},
+                    {num_peaks.data() + beg, end - beg},
+                    {max_ints.data()  + beg, end - beg},
+                    {sum_ints.data()  + beg, end - beg},
+                    verbose && n_threads == 1, zstd_level);
                 for (size_t idx = beg; idx < end; ++idx) {
                     const FrameEntry& fe = frame_index[idx];
                     std::span<const uint32_t> scans, tofs, ints;
@@ -360,7 +323,6 @@ static int write_tdf(
                         return;
                     }
                 }
-                frames_written[k] = writer.frames_written();
             });
         }
         for (auto& t : workers) t.join();
@@ -368,78 +330,47 @@ static int write_tdf(
 
     if (had_error) return 1;
 
-    size_t total_written = 0;
-    for (size_t k = 0; k < n_threads; ++k) total_written += frames_written[k];
-
-    if (n_threads == 1) {
-        // Fast path: just move the single chunk into the output dir.
-        std::filesystem::create_directories(output_dir);
-        std::filesystem::rename(chunk_dirs[0] / "analysis.tdf_bin",
-                                output_dir / "analysis.tdf_bin");
-        std::filesystem::rename(chunk_dirs[0] / "frames_metadata.mmappet",
-                                output_dir / "frames_metadata.mmappet");
-        std::filesystem::remove(chunk_dirs[0]);
-    } else {
-        // Compute cumulative byte offsets from chunk file sizes.
+    if (n_threads > 1) {
+        // Fix up TimsIds in memory (chunk-relative → global byte offsets).
         std::vector<uint64_t> offsets(n_threads, 0);
-        for (size_t k = 1; k < n_threads; ++k) {
-            offsets[k] = offsets[k - 1] +
-                         (uint64_t)std::filesystem::file_size(chunk_dirs[k - 1] / "analysis.tdf_bin");
-        }
-
-        // Fix up TimsId columns in place (chunk-relative → global).
+        for (size_t k = 1; k < n_threads; ++k)
+            offsets[k] = offsets[k - 1] + (uint64_t)std::filesystem::file_size(bin_paths[k - 1]);
         for (size_t k = 0; k < n_threads; ++k) {
-            if (!fixup_tims_ids(chunk_dirs[k] / "frames_metadata.mmappet", offsets[k]))
-                return 1;
+            for (size_t i = slice_starts[k]; i < slice_starts[k + 1]; ++i)
+                tims_ids[i] += offsets[k];
         }
 
-        // Concatenate analysis.tdf_bin files.
+        // Concatenate per-thread binary files into the final analysis.tdf_bin.
         std::filesystem::create_directories(output_dir);
-        {
-            auto out_bin = output_dir / "analysis.tdf_bin";
-            FILE* out = fopen(out_bin.c_str(), "wb");
-            if (!out) {
-                std::cerr << "write_tdf: cannot create " << out_bin << "\n";
+        auto out_bin = output_dir / "analysis.tdf_bin";
+        FILE* out = fopen(out_bin.c_str(), "wb");
+        if (!out) {
+            std::cerr << "write_tdf: cannot create " << out_bin << "\n";
+            return 1;
+        }
+        for (size_t k = 0; k < n_threads; ++k) {
+            if (!append_file(out, bin_paths[k])) {
+                fclose(out);
                 return 1;
             }
-            for (size_t k = 0; k < n_threads; ++k) {
-                if (!append_file(out, chunk_dirs[k] / "analysis.tdf_bin")) {
-                    fclose(out);
-                    return 1;
-                }
-            }
-            fclose(out);
         }
+        fclose(out);
 
-        // Merge frames_metadata.mmappet columns.
-        auto dst_meta = output_dir / "frames_metadata.mmappet";
-        std::filesystem::create_directories(dst_meta);
-
-        // Copy schema.txt from first chunk (all chunks have identical schema).
-        std::filesystem::copy_file(
-            chunk_dirs[0] / "frames_metadata.mmappet" / "schema.txt",
-            dst_meta / "schema.txt",
-            std::filesystem::copy_options::overwrite_existing);
-
-        // Collect chunk meta dirs for column merge.
-        std::vector<std::filesystem::path> chunk_meta_dirs(n_threads);
+        // Remove temp dirs.
         for (size_t k = 0; k < n_threads; ++k)
-            chunk_meta_dirs[k] = chunk_dirs[k] / "frames_metadata.mmappet";
-
-        // 5 columns: Id(0), TimsId(1), NumPeaks(2), MaxIntensity(3), SummedIntensities(4)
-        for (int col = 0; col < 5; ++col) {
-            if (!merge_column(dst_meta, col, chunk_meta_dirs))
-                return 1;
-        }
-
-        // Clean up temp dirs.
-        for (size_t k = 0; k < n_threads; ++k)
-            std::filesystem::remove_all(chunk_dirs[k]);
+            std::filesystem::remove_all(bin_paths[k].parent_path());
     }
 
-    if(verbose) std::print("wrote {} frames to {}\n",
-                           total_written,
-                           (output_dir / "analysis.tdf_bin").string());
+    // Write frames_metadata.mmappet once, after all threads have finished.
+    auto meta = Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
+        "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
+    ).create_writer(output_dir / "frames_metadata.mmappet");
+    meta.write_rows(n_frames,
+        ids.data(), tims_ids.data(), num_peaks.data(), max_ints.data(), sum_ints.data());
+
+    if (verbose) std::print("wrote {} frames to {}\n",
+                            n_frames,
+                            (output_dir / "analysis.tdf_bin").string());
     return 0;
 }
 
