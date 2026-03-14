@@ -23,15 +23,21 @@
 enum Source : int8_t { MS1 = 0, MS2 = 1, EMPTY = -1 };
 struct FrameEntry { uint32_t frame_id; Source source; size_t start; size_t end; };
 
+// write_analysis_tdf.h uses FrameEntry/Source/MS1/MS2/EMPTY defined above.
+#include "write_analysis_tdf.h"
+
 struct Config {
     std::filesystem::path ms1_path;
     std::filesystem::path ms2_path;
     std::optional<std::filesystem::path> output_dir;  // absent = dry-run
+    std::optional<std::filesystem::path> tdf_src;     // template analysis.tdf
+    bool drop_metadata = false;
     size_t max_frames = SIZE_MAX;
     size_t threads = std::thread::hardware_concurrency();
     int zstd_level = 1;
     bool verbose = false;
     bool use_fread = false;
+    AnalysisTdfConfig atdf_cfg;
 };
 
 
@@ -42,16 +48,29 @@ struct Config {
 [[noreturn]] static void usage(const char* prog, int code) {
     std::print(stderr,
         "Usage: {} --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>"
-        " [--output <output.d/>] [--max-frames N] [--threads N]\n"
+        " [--output <output.d/>] [--tdf <analysis.tdf>] [options]\n"
         "\n"
-        "  --ms1 PATH       input MS1 mmappet (frame/scan/tof/intensity)\n"
-        "  --ms2 PATH       input MS2 mmappet (frame/scan/tof/intensity)\n"
-        "  --output PATH    output .d directory; omit to print events instead of writing\n"
-        "  --max-frames N   cap on merged+gap-filled frame sequence (default: all)\n"
-        "  --threads N      number of parallel writer threads (default: all cores)\n"
-        "  --zstd-level N   ZSTD compression level 1-22 (default: 1)\n"
-        "  --verbose        print first/last 10 entries of the frame index\n"
-        "  --use-fread      use fread/fwrite instead of copy_file_range (Linux benchmarking)\n",
+        "  --ms1 PATH           input MS1 mmappet (frame/scan/tof/intensity)\n"
+        "  --ms2 PATH           input MS2 mmappet (frame/scan/tof/intensity)\n"
+        "  --output PATH        output .d directory; omit to print events instead of writing\n"
+        "  --tdf PATH           source analysis.tdf template to copy (required with --output)\n"
+        "  --drop-metadata      skip writing frames_metadata.mmappet\n"
+        "  --max-frames N       cap on merged+gap-filled frame sequence (default: all)\n"
+        "  --threads N          number of parallel writer threads (default: all cores)\n"
+        "  --zstd-level N       ZSTD compression level 1-22 (default: 1)\n"
+        "  --verbose            print first/last 10 entries of the frame index\n"
+        "  --use-fread          use fread/fwrite instead of copy_file_range\n"
+        "  --T1 F               override T1 temperature for all frames\n"
+        "  --T2 F               override T2 temperature for all frames\n"
+        "  --Pressure F         override pressure for all frames\n"
+        "  --accumulation-time F  AccumulationTime in ms (default: 100.0)\n"
+        "  --ramp-time F        RampTime in ms (default: 100.0)\n"
+        "  --denoised N         Denoised flag (default: 0)\n"
+        "  --mz-calibration N   MzCalibration FK (default: 1)\n"
+        "  --polarity C         Polarity '+' or '-' (default: '+')\n"
+        "  --scan-mode N        ScanMode for all frames (default: 9)\n"
+        "  --calib-params C0,..,C9  override TimsCalibration C0-C9 (10 comma-separated floats)\n"
+        "  --dia-windows PATH   mmappet to replace DiaFrameMsMsWindows\n",
         prog);
     std::exit(code);
 }
@@ -79,6 +98,10 @@ static Config parse_args(int argc, char** argv) {
             have_ms2 = true;
         } else if (arg == "--output") {
             cfg.output_dir = need_value("--output");
+        } else if (arg == "--tdf") {
+            cfg.tdf_src = need_value("--tdf");
+        } else if (arg == "--drop-metadata") {
+            cfg.drop_metadata = true;
         } else if (arg == "--max-frames") {
             char* end;
             unsigned long long v = strtoull(need_value("--max-frames"), &end, 10);
@@ -107,6 +130,60 @@ static Config parse_args(int argc, char** argv) {
             cfg.verbose = true;
         } else if (arg == "--use-fread") {
             cfg.use_fread = true;
+        } else if (arg == "--T1") {
+            char* end;
+            cfg.atdf_cfg.T1 = strtod(need_value("--T1"), &end);
+        } else if (arg == "--T2") {
+            char* end;
+            cfg.atdf_cfg.T2 = strtod(need_value("--T2"), &end);
+        } else if (arg == "--Pressure") {
+            char* end;
+            cfg.atdf_cfg.pressure = strtod(need_value("--Pressure"), &end);
+        } else if (arg == "--accumulation-time") {
+            char* end;
+            cfg.atdf_cfg.accumulation_time_ms = strtod(need_value("--accumulation-time"), &end);
+        } else if (arg == "--ramp-time") {
+            char* end;
+            cfg.atdf_cfg.ramp_time_ms = strtod(need_value("--ramp-time"), &end);
+        } else if (arg == "--denoised") {
+            char* end;
+            cfg.atdf_cfg.denoised = (int)strtol(need_value("--denoised"), &end, 10);
+        } else if (arg == "--mz-calibration") {
+            char* end;
+            cfg.atdf_cfg.mz_calibration = (int)strtol(need_value("--mz-calibration"), &end, 10);
+        } else if (arg == "--polarity") {
+            const char* v = need_value("--polarity");
+            if (v[0] != '+' && v[0] != '-') {
+                std::cerr << "Error: --polarity must be '+' or '-'\n";
+                std::exit(1);
+            }
+            cfg.atdf_cfg.polarity = v[0];
+        } else if (arg == "--scan-mode") {
+            char* end;
+            cfg.atdf_cfg.scan_mode = (int)strtol(need_value("--scan-mode"), &end, 10);
+        } else if (arg == "--calib-params") {
+            const char* v = need_value("--calib-params");
+            std::array<double, 10> c{};
+            char* p = const_cast<char*>(v);
+            for (int k = 0; k < 10; ++k) {
+                char* endp;
+                c[k] = strtod(p, &endp);
+                if (endp == p) {
+                    std::cerr << "Error: --calib-params requires 10 comma-separated floats\n";
+                    std::exit(1);
+                }
+                p = endp;
+                if (k < 9) {
+                    if (*p != ',') {
+                        std::cerr << "Error: --calib-params: expected ',' after value " << k << "\n";
+                        std::exit(1);
+                    }
+                    ++p;
+                }
+            }
+            cfg.atdf_cfg.calib_params = c;
+        } else if (arg == "--dia-windows") {
+            cfg.atdf_cfg.dia_windows_path = need_value("--dia-windows");
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0], 0);
         } else {
@@ -117,6 +194,10 @@ static Config parse_args(int argc, char** argv) {
 
     if (!have_ms1 || !have_ms2) {
         std::cerr << "Error: --ms1 and --ms2 are required\n";
+        usage(argv[0], 1);
+    }
+    if (cfg.output_dir && !cfg.tdf_src) {
+        std::cerr << "Error: --tdf is required when --output is given\n";
         usage(argv[0], 1);
     }
     return cfg;
@@ -300,14 +381,22 @@ static int write_tdf(
     bool verbose,
     size_t threads,
     int zstd_level,
-    bool use_fread)
+    bool use_fread,
+    std::vector<uint32_t>& ids,
+    std::vector<uint64_t>& tims_ids,
+    std::vector<uint32_t>& num_peaks,
+    std::vector<uint32_t>& max_ints,
+    std::vector<uint64_t>& sum_ints)
 {
     size_t n_frames  = frame_index.size();
     size_t n_threads = std::min(threads, n_frames > 0 ? n_frames : size_t(1));
 
     // Allocate metadata arrays upfront (one entry per frame, indexed 0..n_frames-1).
-    std::vector<uint32_t> ids(n_frames), num_peaks(n_frames), max_ints(n_frames);
-    std::vector<uint64_t> tims_ids(n_frames), sum_ints(n_frames);
+    ids.assign(n_frames, 0);
+    num_peaks.assign(n_frames, 0);
+    max_ints.assign(n_frames, 0);
+    tims_ids.assign(n_frames, 0);
+    sum_ints.assign(n_frames, 0);
 
     // Per-thread slice boundaries and binary paths.
     std::vector<size_t> slice_starts(n_threads + 1);
@@ -399,13 +488,6 @@ static int write_tdf(
             std::filesystem::remove_all(bin_paths[k].parent_path());
     }
 
-    // Write frames_metadata.mmappet once, after all threads have finished.
-    auto meta = Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
-        "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
-    ).create_writer(output_dir / "frames_metadata.mmappet");
-    meta.write_rows(n_frames,
-        ids.data(), tims_ids.data(), num_peaks.data(), max_ints.data(), sum_ints.data());
-
     if (verbose) std::print("wrote {} frames to {}\n",
                             n_frames,
                             (output_dir / "analysis.tdf_bin").string());
@@ -466,7 +548,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    return write_tdf(
+    std::vector<uint32_t> ids, num_peaks, max_ints;
+    std::vector<uint64_t> tims_ids, sum_ints;
+
+    int rc = write_tdf(
         *cfg.output_dir,
         frame_index,
         ms1_scans, ms1_tofs, ms1_ints,
@@ -475,5 +560,25 @@ int main(int argc, char** argv) {
         cfg.verbose,
         cfg.threads,
         cfg.zstd_level,
-        cfg.use_fread);
+        cfg.use_fread,
+        ids, tims_ids, num_peaks, max_ints, sum_ints);
+    if (rc != 0) return rc;
+
+    if (cfg.tdf_src) {
+        rc = write_analysis_tdf(
+            *cfg.output_dir, *cfg.tdf_src,
+            frame_index, ids, tims_ids, num_peaks, max_ints, sum_ints,
+            total_scans, cfg.atdf_cfg);
+        if (rc != 0) return rc;
+    }
+
+    if (!cfg.drop_metadata) {
+        auto meta = Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
+            "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
+        ).create_writer(*cfg.output_dir / "frames_metadata.mmappet");
+        meta.write_rows(frame_index.size(),
+            ids.data(), tims_ids.data(), num_peaks.data(), max_ints.data(), sum_ints.data());
+    }
+
+    return 0;
 }
