@@ -183,8 +183,12 @@ static void print_frame_index(const std::vector<FrameEntry>& frame_index) {
 
 static void print_dry_run(
     const std::vector<FrameEntry>& frame_index,
-    const MMappedData<uint32_t>& ms1_scans, const MMappedData<uint32_t>& ms1_tofs, const MMappedData<uint32_t>& ms1_ints,
-    const MMappedData<uint32_t>& ms2_scans, const MMappedData<uint32_t>& ms2_tofs, const MMappedData<uint32_t>& ms2_ints)
+    const MMappedData<uint32_t>& ms1_scans,
+    const MMappedData<uint32_t>& ms1_tofs,
+    const MMappedData<uint32_t>& ms1_ints,
+    const MMappedData<uint32_t>& ms2_scans,
+    const MMappedData<uint32_t>& ms2_tofs,
+    const MMappedData<uint32_t>& ms2_ints)
 {
     std::print("frame\tscan\ttof\tintensity\n");
     for (const auto& fe : frame_index) {
@@ -199,7 +203,164 @@ static void print_dry_run(
 
 
 // ---------------------------------------------------------------------------
-// Main
+// Write mode
+// ---------------------------------------------------------------------------
+
+static int write_tdf(
+    const std::filesystem::path& output_dir,
+    const std::vector<FrameEntry>& frame_index,
+    const MMappedData<uint32_t>& ms1_scans,
+    const MMappedData<uint32_t>& ms1_tofs,
+    const MMappedData<uint32_t>& ms1_ints,
+    const MMappedData<uint32_t>& ms2_scans,
+    const MMappedData<uint32_t>& ms2_tofs,
+    const MMappedData<uint32_t>& ms2_ints,
+    uint32_t total_scans,
+    bool verbose)
+{
+    size_t max_frame_event_cnt = 0;
+    for (const auto& fe : frame_index) {
+        size_t n_events = fe.end - fe.start;
+        if (n_events > max_frame_event_cnt) max_frame_event_cnt = n_events;
+    }
+    size_t max_back_size = (size_t)total_scans * 4 + 2 * max_frame_event_cnt * 4;
+    std::vector<uint8_t> compress_buf(max_back_size > 0 ? ZSTD_compressBound(max_back_size) : 1024);
+
+    std::filesystem::create_directories(output_dir);
+    std::filesystem::path output_tdf_bin = output_dir / "analysis.tdf_bin";
+    std::unique_ptr<FILE, decltype(&fclose)> tdf_bin(
+        fopen(output_tdf_bin.c_str(), "wb"), fclose);
+    if (!tdf_bin) {
+        std::cerr << "Failed to open output file: " << output_tdf_bin << "\n";
+        return 1;
+    }
+
+    auto meta_writer = Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
+        "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
+    ).create_writer(output_dir / "frames_metadata.mmappet");
+
+    std::vector<uint32_t> peak_cnts(total_scans);
+    std::vector<uint32_t> tof_deltas;
+    std::vector<uint32_t> interleaved;
+    std::vector<uint8_t>  back_data;
+    std::vector<uint8_t>  real_data;
+
+    for (const auto& fe : frame_index) {
+        uint32_t frame_id     = fe.frame_id;
+        size_t   n_events     = fe.end - fe.start;
+        size_t   start        = fe.start;
+
+        const MMappedData<uint32_t>* scans_col = nullptr;
+        const MMappedData<uint32_t>* tofs_col  = nullptr;
+        const MMappedData<uint32_t>* ints_col  = nullptr;
+        if (fe.source == MS1) {
+            scans_col = &ms1_scans; tofs_col = &ms1_tofs; ints_col = &ms1_ints;
+        } else if (fe.source == MS2) {
+            scans_col = &ms2_scans; tofs_col = &ms2_tofs; ints_col = &ms2_ints;
+        }
+
+        uint64_t tims_id = (uint64_t)ftello(tdf_bin.get());
+
+        // Compute per-frame intensity statistics (max and sum) needed for the
+        // metadata row. These are written later to frames_metadata.mmappet and
+        // are used by downstream tools for filtering and normalization.
+        uint32_t max_int = 0;
+        uint64_t sum_int = 0;
+        if (fe.source != EMPTY) {
+            for (size_t i = start; i < fe.end; ++i) {
+                uint32_t iv = (*ints_col)[i];
+                if (iv > max_int) max_int = iv;
+                sum_int += iv;
+            }
+        }
+
+        // Build peak_cnts header
+        std::fill(peak_cnts.begin(), peak_cnts.end(), 0u);
+        peak_cnts[0] = total_scans;
+        if (fe.source != EMPTY) {
+            for (size_t i = start; i < fe.end; ++i) {
+                uint32_t s = (*scans_col)[i];
+                if (s + 1 < total_scans)
+                    peak_cnts[s + 1]++;
+            }
+            for (uint32_t s = 1; s < total_scans; ++s)
+                peak_cnts[s] *= 2;
+        }
+
+        // Delta-encode TOFs per scan
+        tof_deltas.resize(n_events);
+        if (fe.source != EMPTY) {
+            uint32_t last_tof  = uint32_t(-1);
+            uint32_t last_scan = uint32_t(-1);
+            for (size_t i = 0; i < n_events; ++i) {
+                uint32_t s = (*scans_col)[start + i];
+                if (s != last_scan) { last_tof = uint32_t(-1); last_scan = s; }
+                uint32_t val  = (*tofs_col)[start + i];
+                tof_deltas[i] = val - last_tof;
+                last_tof      = val;
+            }
+        }
+
+        // Interleave [tof_delta, intensity, ...]
+        interleaved.resize(2 * n_events);
+        if (fe.source != EMPTY) {
+            for (size_t i = 0; i < n_events; ++i) {
+                interleaved[2*i]     = tof_deltas[i];
+                interleaved[2*i + 1] = (*ints_col)[start + i];
+            }
+        }
+
+        // Bruker's TDF binary layout stores data in a 4-byte lane-transposed
+        // format: bytes at offsets 0, 4, 8, … form lane 0; offsets 1, 5, 9, …
+        // form lane 1; etc. The loop below reorders back_data (peak_cnts header
+        // followed by interleaved tof/intensity pairs) into that layout in
+        // real_data, which is then ZSTD-compressed for better locality.
+        // 4-byte lane transpose
+        size_t back_size = (size_t)total_scans * 4 + 2 * n_events * 4;
+        back_data.resize(back_size);
+        real_data.resize(back_size);
+        memcpy(back_data.data(), peak_cnts.data(), (size_t)total_scans * 4);
+        if (n_events > 0)
+            memcpy(back_data.data() + (size_t)total_scans * 4, interleaved.data(), 2 * n_events * 4);
+        {
+            size_t reminder = 0, bd_idx = 0;
+            for (size_t rd_idx = 0; rd_idx < back_size; ++rd_idx) {
+                if (bd_idx >= back_size) { ++reminder; bd_idx = reminder; }
+                real_data[rd_idx] = back_data[bd_idx];
+                bd_idx += 4;
+            }
+        }
+
+        // ZSTD compress
+        size_t comp_size = ZSTD_compress(
+            compress_buf.data(), compress_buf.size(), real_data.data(), back_size, 1);
+        if (ZSTD_isError(comp_size)) {
+            std::cerr << "ZSTD compression error: " << ZSTD_getErrorName(comp_size) << "\n";
+            return 1;
+        }
+
+        // Write block
+        uint32_t block_size = (uint32_t)(comp_size + 8);
+        fwrite(&block_size,  4, 1, tdf_bin.get());
+        fwrite(&total_scans, 4, 1, tdf_bin.get());
+        fwrite(compress_buf.data(), 1, comp_size, tdf_bin.get());
+
+        meta_writer.write_row(frame_id, tims_id, (uint32_t)n_events, max_int, sum_int);
+
+        if (verbose) {
+            const char* src_str = (fe.source == MS1) ? "ms1" : (fe.source == MS2) ? "ms2" : "empty";
+            std::print("frame {}  src={}  n_events={}  tims_id={}  max_int={}  sum_int={}\n",
+                       frame_id, src_str, n_events, tims_id, max_int, sum_int);
+        }
+    }
+
+    std::print("wrote {} frames to {}\n", frame_index.size(), output_tdf_bin.string());
+    return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// Entry point
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -249,138 +410,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // -----------------------------------------------------------------------
-    // Write mode
-    // -----------------------------------------------------------------------
-    const auto& output_dir = *cfg.output_dir;
-
-    size_t max_frame_event_cnt = 0;
-    for (const auto& fe : frame_index) {
-        size_t n_events = fe.end - fe.start;
-        if (n_events > max_frame_event_cnt) max_frame_event_cnt = n_events;
-    }
-    size_t max_back_size = (size_t)total_scans * 4 + 2 * max_frame_event_cnt * 4;
-    std::vector<uint8_t> compress_buf(max_back_size > 0 ? ZSTD_compressBound(max_back_size) : 1024);
-
-    std::filesystem::create_directories(output_dir);
-    std::filesystem::path output_tdf_bin = output_dir / "analysis.tdf_bin";
-    FILE* tdf_bin = fopen(output_tdf_bin.c_str(), "wb");
-    if (!tdf_bin) {
-        std::cerr << "Failed to open output file: " << output_tdf_bin << "\n";
-        return 1;
-    }
-
-    auto meta_writer = Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
-        "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
-    ).create_writer(output_dir / "frames_metadata.mmappet");
-
-    std::vector<uint32_t> peak_cnts(total_scans);
-    std::vector<uint32_t> tof_deltas;
-    std::vector<uint32_t> interleaved;
-    std::vector<uint8_t>  back_data;
-    std::vector<uint8_t>  real_data;
-
-    for (const auto& fe : frame_index) {
-        uint32_t frame_id     = fe.frame_id;
-        size_t   n_events     = fe.end - fe.start;
-        size_t   start        = fe.start;
-
-        const MMappedData<uint32_t>* scans_col = nullptr;
-        const MMappedData<uint32_t>* tofs_col  = nullptr;
-        const MMappedData<uint32_t>* ints_col  = nullptr;
-        if (fe.source == MS1) {
-            scans_col = &ms1_scans; tofs_col = &ms1_tofs; ints_col = &ms1_ints;
-        } else if (fe.source == MS2) {
-            scans_col = &ms2_scans; tofs_col = &ms2_tofs; ints_col = &ms2_ints;
-        }
-
-        uint64_t tims_id = (uint64_t)ftello(tdf_bin);
-
-        uint32_t max_int = 0;
-        uint64_t sum_int = 0;
-        if (fe.source != EMPTY) {
-            for (size_t i = start; i < fe.end; ++i) {
-                uint32_t iv = (*ints_col)[i];
-                if (iv > max_int) max_int = iv;
-                sum_int += iv;
-            }
-        }
-
-        // Build peak_cnts header
-        std::fill(peak_cnts.begin(), peak_cnts.end(), 0u);
-        peak_cnts[0] = total_scans;
-        if (fe.source != EMPTY) {
-            for (size_t i = start; i < fe.end; ++i) {
-                uint32_t s = (*scans_col)[i];
-                if (s + 1 < total_scans)
-                    peak_cnts[s + 1]++;
-            }
-            for (uint32_t s = 1; s < total_scans; ++s)
-                peak_cnts[s] *= 2;
-        }
-
-        // Delta-encode TOFs per scan
-        tof_deltas.resize(n_events);
-        if (fe.source != EMPTY) {
-            uint32_t last_tof  = uint32_t(-1);
-            uint32_t last_scan = uint32_t(-1);
-            for (size_t i = 0; i < n_events; ++i) {
-                uint32_t s = (*scans_col)[start + i];
-                if (s != last_scan) { last_tof = uint32_t(-1); last_scan = s; }
-                uint32_t val  = (*tofs_col)[start + i];
-                tof_deltas[i] = val - last_tof;
-                last_tof      = val;
-            }
-        }
-
-        // Interleave [tof_delta, intensity, ...]
-        interleaved.resize(2 * n_events);
-        if (fe.source != EMPTY) {
-            for (size_t i = 0; i < n_events; ++i) {
-                interleaved[2*i]     = tof_deltas[i];
-                interleaved[2*i + 1] = (*ints_col)[start + i];
-            }
-        }
-
-        // 4-byte lane transpose
-        size_t back_size = (size_t)total_scans * 4 + 2 * n_events * 4;
-        back_data.resize(back_size);
-        real_data.resize(back_size);
-        memcpy(back_data.data(), peak_cnts.data(), (size_t)total_scans * 4);
-        if (n_events > 0)
-            memcpy(back_data.data() + (size_t)total_scans * 4, interleaved.data(), 2 * n_events * 4);
-        {
-            size_t reminder = 0, bd_idx = 0;
-            for (size_t rd_idx = 0; rd_idx < back_size; ++rd_idx) {
-                if (bd_idx >= back_size) { ++reminder; bd_idx = reminder; }
-                real_data[rd_idx] = back_data[bd_idx];
-                bd_idx += 4;
-            }
-        }
-
-        // ZSTD compress
-        size_t comp_size = ZSTD_compress(
-            compress_buf.data(), compress_buf.size(), real_data.data(), back_size, 1);
-        if (ZSTD_isError(comp_size)) {
-            std::cerr << "ZSTD compression error: " << ZSTD_getErrorName(comp_size) << "\n";
-            fclose(tdf_bin);
-            return 1;
-        }
-
-        // Write block
-        uint32_t block_size = (uint32_t)(comp_size + 8);
-        fwrite(&block_size,  4, 1, tdf_bin);
-        fwrite(&total_scans, 4, 1, tdf_bin);
-        fwrite(compress_buf.data(), 1, comp_size, tdf_bin);
-
-        meta_writer.write_row(frame_id, tims_id, (uint32_t)n_events, max_int, sum_int);
-
-        const char* src_str = (fe.source == MS1) ? "ms1" : (fe.source == MS2) ? "ms2" : "empty";
-        std::print("frame {}  src={}  n_events={}  tims_id={}  max_int={}  sum_int={}\n",
-                   frame_id, src_str, n_events, tims_id, max_int, sum_int);
-    }
-
-    std::print("wrote {} frames to {}\n", frame_index.size(), output_tdf_bin.string());
-    fclose(tdf_bin);
-    return 0;
+    return write_tdf(
+        *cfg.output_dir,
+        frame_index,
+        ms1_scans, ms1_tofs, ms1_ints,
+        ms2_scans, ms2_tofs, ms2_ints,
+        total_scans,
+        cfg.verbose);
 }
