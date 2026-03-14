@@ -10,6 +10,10 @@
 #include <string_view>
 #include <thread>
 #include <atomic>
+#ifdef __linux__
+#  include <sys/stat.h>
+#  include <fcntl.h>
+#endif
 
 
 // ---------------------------------------------------------------------------
@@ -24,9 +28,10 @@ struct Config {
     std::filesystem::path ms2_path;
     std::optional<std::filesystem::path> output_dir;  // absent = dry-run
     size_t max_frames = SIZE_MAX;
-    size_t threads = 1;
+    size_t threads = std::thread::hardware_concurrency();
     int zstd_level = 1;
     bool verbose = false;
+    bool use_fread = false;
 };
 
 
@@ -35,17 +40,19 @@ struct Config {
 // ---------------------------------------------------------------------------
 
 [[noreturn]] static void usage(const char* prog, int code) {
-    std::cerr
-        << "Usage: " << prog << " --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>"
-        << " [--output <output.d/>] [--max-frames N] [--threads N]\n"
-        << "\n"
-        << "  --ms1 PATH       input MS1 mmappet (frame/scan/tof/intensity)\n"
-        << "  --ms2 PATH       input MS2 mmappet (frame/scan/tof/intensity)\n"
-        << "  --output PATH    output .d directory; omit to print events instead of writing\n"
-        << "  --max-frames N   cap on merged+gap-filled frame sequence (default: all)\n"
-        << "  --threads N      number of parallel writer threads (default: 1)\n"
-        << "  --zstd-level N   ZSTD compression level 1-22 (default: 1)\n"
-        << "  --verbose        print first/last 10 entries of the frame index\n";
+    std::print(stderr,
+        "Usage: {} --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>"
+        " [--output <output.d/>] [--max-frames N] [--threads N]\n"
+        "\n"
+        "  --ms1 PATH       input MS1 mmappet (frame/scan/tof/intensity)\n"
+        "  --ms2 PATH       input MS2 mmappet (frame/scan/tof/intensity)\n"
+        "  --output PATH    output .d directory; omit to print events instead of writing\n"
+        "  --max-frames N   cap on merged+gap-filled frame sequence (default: all)\n"
+        "  --threads N      number of parallel writer threads (default: all cores)\n"
+        "  --zstd-level N   ZSTD compression level 1-22 (default: 1)\n"
+        "  --verbose        print first/last 10 entries of the frame index\n"
+        "  --use-fread      use fread/fwrite instead of copy_file_range (Linux benchmarking)\n",
+        prog);
     std::exit(code);
 }
 
@@ -98,6 +105,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.zstd_level = (int)v;
         } else if (arg == "--verbose") {
             cfg.verbose = true;
+        } else if (arg == "--use-fread") {
+            cfg.use_fread = true;
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0], 0);
         } else {
@@ -227,7 +236,35 @@ static void print_dry_run(
 // ---------------------------------------------------------------------------
 
 // Append contents of file `src` to already-open FILE* `dst`.
-static bool append_file(FILE* dst, const std::filesystem::path& src) {
+static bool append_file(FILE* dst, const std::filesystem::path& src, bool use_fread = false) {
+#ifdef __linux__
+    if (!use_fread) {
+        int src_fd = open(src.c_str(), O_RDONLY);
+        if (src_fd < 0) {
+            std::cerr << "append_file: cannot open " << src << "\n";
+            return false;
+        }
+        struct stat st;
+        if (fstat(src_fd, &st) < 0) {
+            close(src_fd);
+            std::cerr << "append_file: fstat failed: " << src << "\n";
+            return false;
+        }
+        size_t remaining = (size_t)st.st_size;
+        int dst_fd = fileno(dst);
+        while (remaining > 0) {
+            ssize_t n = copy_file_range(src_fd, nullptr, dst_fd, nullptr, remaining, 0);
+            if (n <= 0) {
+                close(src_fd);
+                std::cerr << "append_file: copy_file_range failed\n";
+                return false;
+            }
+            remaining -= (size_t)n;
+        }
+        close(src_fd);
+        return true;
+    }
+#endif
     FILE* f = fopen(src.c_str(), "rb");
     if (!f) {
         std::cerr << "append_file: cannot open " << src << "\n";
@@ -262,7 +299,8 @@ static int write_tdf(
     uint32_t total_scans,
     bool verbose,
     size_t threads,
-    int zstd_level)
+    int zstd_level,
+    bool use_fread)
 {
     size_t n_frames  = frame_index.size();
     size_t n_threads = std::min(threads, n_frames > 0 ? n_frames : size_t(1));
@@ -349,7 +387,7 @@ static int write_tdf(
             return 1;
         }
         for (size_t k = 0; k < n_threads; ++k) {
-            if (!append_file(out, bin_paths[k])) {
+            if (!append_file(out, bin_paths[k], use_fread)) {
                 fclose(out);
                 return 1;
             }
@@ -436,5 +474,6 @@ int main(int argc, char** argv) {
         total_scans,
         cfg.verbose,
         cfg.threads,
-        cfg.zstd_level);
+        cfg.zstd_level,
+        cfg.use_fread);
 }

@@ -14,7 +14,8 @@ main.o: main.cpp
 	$(CXX) $(CXXFLAGS) -c $<
 
 test: pmsms2tdf
-	./pmsms2tdf $(MS1_IN) $(MS2_IN) $(TEST_OUT)
+	rm -rf $(TEST_OUT)
+	./pmsms2tdf --ms1 $(MS1_IN) --ms2 $(MS2_IN) --output $(TEST_OUT)
 	cp $(TDF_SRC)/analysis.tdf $(TEST_OUT)/analysis.tdf
 	$(PYTHON) tests/update_frames_table.py $(TEST_OUT)
 	$(PYTHON) tests/roundtrip_test.py $(TDF_SRC) $(TEST_OUT)
