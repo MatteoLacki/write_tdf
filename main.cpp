@@ -8,6 +8,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string_view>
+#include <thread>
+#include <atomic>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 
 // ---------------------------------------------------------------------------
@@ -22,6 +27,8 @@ struct Config {
     std::filesystem::path ms2_path;
     std::optional<std::filesystem::path> output_dir;  // absent = dry-run
     size_t max_frames = SIZE_MAX;
+    size_t threads = 1;
+    int zstd_level = 1;
     bool verbose = false;
 };
 
@@ -33,12 +40,14 @@ struct Config {
 [[noreturn]] static void usage(const char* prog, int code) {
     std::cerr
         << "Usage: " << prog << " --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>"
-        << " [--output <output.d/>] [--max-frames N]\n"
+        << " [--output <output.d/>] [--max-frames N] [--threads N]\n"
         << "\n"
         << "  --ms1 PATH       input MS1 mmappet (frame/scan/tof/intensity)\n"
         << "  --ms2 PATH       input MS2 mmappet (frame/scan/tof/intensity)\n"
         << "  --output PATH    output .d directory; omit to print events instead of writing\n"
         << "  --max-frames N   cap on merged+gap-filled frame sequence (default: all)\n"
+        << "  --threads N      number of parallel writer threads (default: 1)\n"
+        << "  --zstd-level N   ZSTD compression level 1-22 (default: 1)\n"
         << "  --verbose        print first/last 10 entries of the frame index\n";
     std::exit(code);
 }
@@ -74,6 +83,22 @@ static Config parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             cfg.max_frames = (size_t)v;
+        } else if (arg == "--threads") {
+            char* end;
+            unsigned long long v = strtoull(need_value("--threads"), &end, 10);
+            if (*end != '\0' || v == 0) {
+                std::cerr << "Error: --threads must be a positive integer\n";
+                std::exit(1);
+            }
+            cfg.threads = (size_t)v;
+        } else if (arg == "--zstd-level") {
+            char* end;
+            long v = strtol(need_value("--zstd-level"), &end, 10);
+            if (*end != '\0' || v < 1 || v > 22) {
+                std::cerr << "Error: --zstd-level must be an integer between 1 and 22\n";
+                std::exit(1);
+            }
+            cfg.zstd_level = (int)v;
         } else if (arg == "--verbose") {
             cfg.verbose = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -201,6 +226,81 @@ static void print_dry_run(
 
 
 // ---------------------------------------------------------------------------
+// Merge helpers
+// ---------------------------------------------------------------------------
+
+// Append contents of file `src` to already-open FILE* `dst`.
+static bool append_file(FILE* dst, const std::filesystem::path& src) {
+    FILE* f = fopen(src.c_str(), "rb");
+    if (!f) {
+        std::cerr << "append_file: cannot open " << src << "\n";
+        return false;
+    }
+    char buf[1 << 20];  // 1 MB stack buffer
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) {
+            fclose(f);
+            std::cerr << "append_file: write error\n";
+            return false;
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+// Add `byte_offset` to every uint64_t in `meta_dir/1.bin` (the TimsId column).
+static bool fixup_tims_ids(const std::filesystem::path& meta_dir, uint64_t byte_offset) {
+    if (byte_offset == 0) return true;
+    auto path = meta_dir / "1.bin";
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+        std::cerr << "fixup_tims_ids: open failed: " << path << "\n";
+        return false;
+    }
+    struct stat st;
+    fstat(fd, &st);
+    size_t sz = (size_t)st.st_size;
+    if (sz == 0) { close(fd); return true; }
+    void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        std::cerr << "fixup_tims_ids: mmap failed\n";
+        return false;
+    }
+    auto* data = static_cast<uint64_t*>(p);
+    size_t count = sz / sizeof(uint64_t);
+    for (size_t i = 0; i < count; ++i)
+        data[i] += byte_offset;
+    msync(p, sz, MS_SYNC);
+    munmap(p, sz);
+    return true;
+}
+
+// Concatenate `chunk_meta_dirs[k]/col_idx.bin` into `dst_dir/col_idx.bin`.
+static bool merge_column(const std::filesystem::path& dst_dir,
+                         int col_idx,
+                         const std::vector<std::filesystem::path>& chunk_meta_dirs)
+{
+    auto dst_path = dst_dir / (std::to_string(col_idx) + ".bin");
+    FILE* out = fopen(dst_path.c_str(), "wb");
+    if (!out) {
+        std::cerr << "merge_column: cannot create " << dst_path << "\n";
+        return false;
+    }
+    for (const auto& src_dir : chunk_meta_dirs) {
+        auto src_path = src_dir / (std::to_string(col_idx) + ".bin");
+        if (!append_file(out, src_path)) {
+            fclose(out);
+            return false;
+        }
+    }
+    fclose(out);
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
 // Write mode
 // ---------------------------------------------------------------------------
 
@@ -214,26 +314,132 @@ static int write_tdf(
     const MMappedData<uint32_t>& ms2_tofs,
     const MMappedData<uint32_t>& ms2_ints,
     uint32_t total_scans,
-    bool verbose)
+    bool verbose,
+    size_t threads,
+    int zstd_level)
 {
-    TdfWriter writer(output_dir, total_scans, verbose);
-    for (const auto& fe : frame_index) {
-        std::span<const uint32_t> scans, tofs, ints;
-        if (fe.source == MS1) {
-            scans = {ms1_scans.data() + fe.start, fe.end - fe.start};
-            tofs  = {ms1_tofs.data()  + fe.start, fe.end - fe.start};
-            ints  = {ms1_ints.data()  + fe.start, fe.end - fe.start};
-        } else if (fe.source == MS2) {
-            scans = {ms2_scans.data() + fe.start, fe.end - fe.start};
-            tofs  = {ms2_tofs.data()  + fe.start, fe.end - fe.start};
-            ints  = {ms2_ints.data()  + fe.start, fe.end - fe.start};
-        }
-        // EMPTY: all spans remain default-constructed (empty)
-        if (!writer.write_frame(fe.frame_id, scans, tofs, ints))
-            return 1;
+    size_t n_frames = frame_index.size();
+    size_t n_threads = std::min(threads, n_frames > 0 ? n_frames : size_t(1));
+
+    // Build chunk directories and per-thread frame slices.
+    std::vector<std::filesystem::path> chunk_dirs(n_threads);
+    std::vector<size_t> slice_starts(n_threads + 1);
+    for (size_t k = 0; k < n_threads; ++k) {
+        chunk_dirs[k] = output_dir / ("_tmp_" + std::to_string(k));
+        slice_starts[k] = k * n_frames / n_threads;
     }
-    std::print("wrote {} frames to {}\n",
-               writer.frames_written(), (output_dir / "analysis.tdf_bin").string());
+    slice_starts[n_threads] = n_frames;
+
+    // Launch threads — each writes its slice to its own chunk dir.
+    std::atomic<bool> had_error{false};
+    std::vector<size_t> frames_written(n_threads, 0);
+    {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        for (size_t k = 0; k < n_threads; ++k) {
+            workers.emplace_back([&, k]() {
+                // verbose only when single-threaded (avoids interleaved output)
+                TdfWriter writer(chunk_dirs[k], total_scans, verbose && n_threads == 1, zstd_level);
+                size_t beg = slice_starts[k];
+                size_t end = slice_starts[k + 1];
+                for (size_t idx = beg; idx < end; ++idx) {
+                    const FrameEntry& fe = frame_index[idx];
+                    std::span<const uint32_t> scans, tofs, ints;
+                    if (fe.source == MS1) {
+                        scans = {ms1_scans.data() + fe.start, fe.end - fe.start};
+                        tofs  = {ms1_tofs.data()  + fe.start, fe.end - fe.start};
+                        ints  = {ms1_ints.data()  + fe.start, fe.end - fe.start};
+                    } else if (fe.source == MS2) {
+                        scans = {ms2_scans.data() + fe.start, fe.end - fe.start};
+                        tofs  = {ms2_tofs.data()  + fe.start, fe.end - fe.start};
+                        ints  = {ms2_ints.data()  + fe.start, fe.end - fe.start};
+                    }
+                    // EMPTY: all spans remain default-constructed (empty)
+                    if (!writer.write_frame(fe.frame_id, scans, tofs, ints)) {
+                        had_error.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+                frames_written[k] = writer.frames_written();
+            });
+        }
+        for (auto& t : workers) t.join();
+    }
+
+    if (had_error) return 1;
+
+    size_t total_written = 0;
+    for (size_t k = 0; k < n_threads; ++k) total_written += frames_written[k];
+
+    if (n_threads == 1) {
+        // Fast path: just move the single chunk into the output dir.
+        std::filesystem::create_directories(output_dir);
+        std::filesystem::rename(chunk_dirs[0] / "analysis.tdf_bin",
+                                output_dir / "analysis.tdf_bin");
+        std::filesystem::rename(chunk_dirs[0] / "frames_metadata.mmappet",
+                                output_dir / "frames_metadata.mmappet");
+        std::filesystem::remove(chunk_dirs[0]);
+    } else {
+        // Compute cumulative byte offsets from chunk file sizes.
+        std::vector<uint64_t> offsets(n_threads, 0);
+        for (size_t k = 1; k < n_threads; ++k) {
+            offsets[k] = offsets[k - 1] +
+                         (uint64_t)std::filesystem::file_size(chunk_dirs[k - 1] / "analysis.tdf_bin");
+        }
+
+        // Fix up TimsId columns in place (chunk-relative → global).
+        for (size_t k = 0; k < n_threads; ++k) {
+            if (!fixup_tims_ids(chunk_dirs[k] / "frames_metadata.mmappet", offsets[k]))
+                return 1;
+        }
+
+        // Concatenate analysis.tdf_bin files.
+        std::filesystem::create_directories(output_dir);
+        {
+            auto out_bin = output_dir / "analysis.tdf_bin";
+            FILE* out = fopen(out_bin.c_str(), "wb");
+            if (!out) {
+                std::cerr << "write_tdf: cannot create " << out_bin << "\n";
+                return 1;
+            }
+            for (size_t k = 0; k < n_threads; ++k) {
+                if (!append_file(out, chunk_dirs[k] / "analysis.tdf_bin")) {
+                    fclose(out);
+                    return 1;
+                }
+            }
+            fclose(out);
+        }
+
+        // Merge frames_metadata.mmappet columns.
+        auto dst_meta = output_dir / "frames_metadata.mmappet";
+        std::filesystem::create_directories(dst_meta);
+
+        // Copy schema.txt from first chunk (all chunks have identical schema).
+        std::filesystem::copy_file(
+            chunk_dirs[0] / "frames_metadata.mmappet" / "schema.txt",
+            dst_meta / "schema.txt",
+            std::filesystem::copy_options::overwrite_existing);
+
+        // Collect chunk meta dirs for column merge.
+        std::vector<std::filesystem::path> chunk_meta_dirs(n_threads);
+        for (size_t k = 0; k < n_threads; ++k)
+            chunk_meta_dirs[k] = chunk_dirs[k] / "frames_metadata.mmappet";
+
+        // 5 columns: Id(0), TimsId(1), NumPeaks(2), MaxIntensity(3), SummedIntensities(4)
+        for (int col = 0; col < 5; ++col) {
+            if (!merge_column(dst_meta, col, chunk_meta_dirs))
+                return 1;
+        }
+
+        // Clean up temp dirs.
+        for (size_t k = 0; k < n_threads; ++k)
+            std::filesystem::remove_all(chunk_dirs[k]);
+    }
+
+    if(verbose) std::print("wrote {} frames to {}\n",
+                           total_written,
+                           (output_dir / "analysis.tdf_bin").string());
     return 0;
 }
 
@@ -270,8 +476,10 @@ int main(int argc, char** argv) {
         if (fe.source == MS1) ms1_events = std::max(ms1_events, fe.end);
         if (fe.source == MS2) ms2_events = std::max(ms2_events, fe.end);
     }
-    std::print("ms1 events used: {} / {}\n", ms1_events, ms1_frames.size());
-    std::print("ms2 events used: {} / {}\n", ms2_events, ms2_frames.size());
+    if (cfg.verbose){
+        std::print("ms1 events used: {} / {}\n", ms1_events, ms1_frames.size());
+        std::print("ms2 events used: {} / {}\n", ms2_events, ms2_frames.size());
+    }
 
     uint32_t max_scan = 0;
     for (size_t i = 0; i < ms1_events; ++i)
@@ -279,7 +487,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < ms2_events; ++i)
         if (ms2_scans[i] > max_scan) max_scan = ms2_scans[i];
     uint32_t total_scans = (ms1_events + ms2_events > 0) ? max_scan + 1 : 0;
-    std::print("total_scans: {}\n", total_scans);
+    if (cfg.verbose) std::print("total_scans: {}\n", total_scans);
 
     // -----------------------------------------------------------------------
     // Dry-run: print events in the order they would be written
@@ -295,5 +503,7 @@ int main(int argc, char** argv) {
         ms1_scans, ms1_tofs, ms1_ints,
         ms2_scans, ms2_tofs, ms2_ints,
         total_scans,
-        cfg.verbose);
+        cfg.verbose,
+        cfg.threads,
+        cfg.zstd_level);
 }

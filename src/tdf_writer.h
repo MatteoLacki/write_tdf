@@ -20,9 +20,11 @@ public:
     // written into every frame block.
     TdfWriter(const std::filesystem::path& output_dir,
               uint32_t total_scans,
-              bool verbose = false)
+              bool verbose = false,
+              int zstd_level = 1)
         : total_scans_(total_scans)
         , verbose_(verbose)
+        , zstd_level_(zstd_level)
         , output_tdf_bin_(output_dir / "analysis.tdf_bin")
         , tdf_bin_(nullptr, fclose)
         , meta_writer_(std::nullopt)
@@ -123,7 +125,7 @@ public:
             compress_buf_.resize(compress_bound);
 
         size_t comp_size = ZSTD_compress(
-            compress_buf_.data(), compress_buf_.size(), real_data_.data(), back_size, 1);
+            compress_buf_.data(), compress_buf_.size(), real_data_.data(), back_size, zstd_level_);
         if (ZSTD_isError(comp_size)) {
             std::cerr << "ZSTD compression error: " << ZSTD_getErrorName(comp_size) << "\n";
             return false;
@@ -151,6 +153,7 @@ public:
 private:
     uint32_t total_scans_;
     bool verbose_;
+    int zstd_level_;
     std::filesystem::path output_tdf_bin_;
     std::unique_ptr<FILE, decltype(&fclose)> tdf_bin_;
     std::optional<FrameMetaWriter> meta_writer_;

@@ -1,6 +1,6 @@
 CXX      := clang++
 CXXFLAGS := -std=c++23 -O3 -Wall -Isrc
-LDFLAGS  := -lzstd
+LDFLAGS  := -lzstd -lpthread
 PYTHON   := ../../venvs/common/bin/python
 MS1_IN   := tests/F9477_ms1.mmappet
 MS2_IN   := tests/F9477_ms2.mmappet
