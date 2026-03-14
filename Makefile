@@ -1,12 +1,46 @@
 CXX      := clang++
 CC       := clang
 CXXFLAGS := -std=c++23 -O3 -Wall -Isrc
-LDFLAGS  := -lzstd -lpthread
+LDFLAGS  := -lpthread
 PYTHON   := ../../venvs/common/bin/python
 MS1_IN   := tests/F9477_ms1.mmappet
 MS2_IN   := tests/F9477_ms2.mmappet
 TEST_OUT := /tmp/pmsms2tdf_roundtrip.d
 TDF_SRC  := tests/F9477.d
+
+# ---------------------------------------------------------------------------
+# zstd: vendored by default; override with ZSTD_PREFIX=/path for system/custom zstd
+# ---------------------------------------------------------------------------
+ZSTD_VERSION := 1.5.6
+ZSTD_SRC     := src/zstd_bundled/zstd-$(ZSTD_VERSION)
+
+ifdef ZSTD_PREFIX
+  ZSTD_CFLAGS := -I$(ZSTD_PREFIX)/include
+  ZSTD_LIBS   := -L$(ZSTD_PREFIX)/lib -lzstd
+  ZSTD_DEPS   :=
+else
+  ZSTD_CFLAGS := -I$(ZSTD_SRC)/lib
+  ZSTD_LIBS   := $(ZSTD_SRC)/lib/libzstd.a
+  ZSTD_DEPS   := $(ZSTD_SRC)/lib/libzstd.a
+endif
+
+CXXFLAGS += $(ZSTD_CFLAGS)
+LDFLAGS  += $(ZSTD_LIBS)
+
+# ---------------------------------------------------------------------------
+# mmappet.h resolution (three-tier: MMAPPET_H env var → sibling repo → bundled)
+# ---------------------------------------------------------------------------
+MMAPPET_SIBLING := ../mmappet/src/mmappet/cpp/mmappet/mmappet.h
+
+ifdef MMAPPET_H
+  MMAPPET_CFLAGS := -I$(dir $(MMAPPET_H))
+else ifneq ($(wildcard $(MMAPPET_SIBLING)),)
+  MMAPPET_CFLAGS := -I$(dir $(MMAPPET_SIBLING))
+else
+  MMAPPET_CFLAGS :=  # bundled src/mmappet.h, already covered by -Isrc
+endif
+
+CXXFLAGS += $(MMAPPET_CFLAGS)
 
 # ---------------------------------------------------------------------------
 # SQLite detection (three-tier: user prefix → pkg-config → bundled amalgamation)
@@ -31,7 +65,7 @@ LDFLAGS  += $(SQLITE3_LIBS)
 # Targets
 # ---------------------------------------------------------------------------
 
-pmsms2tdf: main.o $(AMALGAMATION_DEPS)
+pmsms2tdf: main.o $(ZSTD_DEPS) $(AMALGAMATION_DEPS)
 	$(CXX) $^ -o $@ $(LDFLAGS)
 
 main.o: main.cpp
@@ -39,6 +73,15 @@ main.o: main.cpp
 
 src/sqlite_amalgamation/sqlite3.o: src/sqlite_amalgamation/sqlite3.c
 	$(CC) -O2 -c $< -o $@
+
+$(ZSTD_SRC)/lib/libzstd.a: | src/zstd_bundled
+	curl -fsSL \
+	  https://github.com/facebook/zstd/releases/download/v$(ZSTD_VERSION)/zstd-$(ZSTD_VERSION).tar.gz \
+	  | tar -xz -C src/zstd_bundled
+	$(MAKE) -C $(ZSTD_SRC) lib/libzstd.a CC=$(CC)
+
+src/zstd_bundled:
+	mkdir -p $@
 
 test: pmsms2tdf
 	rm -rf $(TEST_OUT)
