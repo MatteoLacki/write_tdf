@@ -42,20 +42,6 @@ On the first build, `make` downloads the zstd 1.5.6 source tarball, builds a
 static `libzstd.a`, then compiles `pmsms2tdf`. Subsequent builds skip the
 download and use the cached library.
 
-```bash
-make test   # round-trip verification against the bundled test dataset
-```
-
-Expected output:
-
-```
-frames built: 9560
-wrote 9560 frames to /tmp/pmsms2tdf_roundtrip.d/analysis.tdf_bin
-wrote analysis.tdf (9560 frames)
-
-All 9560 frames match.
-```
-
 ---
 
 ## CLI usage
@@ -121,24 +107,6 @@ that prints the merged event table to stdout instead of writing any files.
   --ms2 data/run1_ms2.mmappet \
   | head -20
 ```
-
----
-
-## Input format: mmappet
-
-An mmappet directory is a flat set of binary column files plus a schema:
-
-```
-run1_ms1.mmappet/
-├── schema.txt   # one "type name" line per column, e.g. "uint32 frame"
-├── 0.bin        # frame column  (uint32, row-major)
-├── 1.bin        # scan column   (uint32)
-├── 2.bin        # tof column    (uint32)
-└── 3.bin        # intensity column (uint32)
-```
-
-Both inputs must be **sorted by `frame` ascending**. Within each frame, events
-can be in any order.
 
 ---
 
