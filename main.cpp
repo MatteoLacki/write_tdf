@@ -47,6 +47,15 @@ struct Config {
 
 [[noreturn]] static void usage(const char* prog, int code) {
     std::print(stderr,
+        "pmsms2tdf -- convert MS1/MS2 mmappet event data into a Bruker timsTOF .d folder.\n"
+        "\n"
+        "Reads two columnar memory-mapped datasets (MS1 and MS2), merges their frame\n"
+        "sequences, fills any gaps with empty frames, encodes each frame as a\n"
+        "ZSTD-compressed binary block (analysis.tdf_bin), and writes the accompanying\n"
+        "SQLite metadata (analysis.tdf) by repopulating a user-supplied template.\n"
+        "The output .d folder can be opened directly by OpenTIMS, Bruker DataAnalysis,\n"
+        "or any other tool that reads the timsTOF data format.\n"
+        "\n"
         "Usage: {} --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>"
         " [--output <output.d/>] [--tdf <analysis.tdf>] [options]\n"
         "\n"

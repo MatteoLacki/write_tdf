@@ -29,18 +29,19 @@ ms2.mmappet ──┘                       ├── analysis.tdf_bin   (frame 
 
 ## Build
 
-**Requirements:** `clang++` (C++23), `clang` (C compiler), `curl`, `tar`, `make`.
-No other system dependencies are required — zstd is vendored automatically.
+**Requirements:** `clang++` (C++23), `make`, `libzstd` (system package).
 
 ```bash
+# Ubuntu/Debian
+sudo apt install libzstd-dev
+
+# Arch
+sudo pacman -S zstd
+
 git clone https://github.com/yourorg/write_tdf
 cd write_tdf
 make
 ```
-
-On the first build, `make` downloads the zstd 1.5.6 source tarball, builds a
-static `libzstd.a`, then compiles `pmsms2tdf`. Subsequent builds skip the
-download and use the cached library.
 
 ---
 
@@ -182,8 +183,8 @@ All dependencies are resolved at build time with no manual installation required
 
 | Priority | Condition | Source |
 |----------|-----------|--------|
-| 1 | `ZSTD_PREFIX=/path` set | System or custom installation |
-| 2 | *(fallback)* | Vendored: downloaded and built as `libzstd.a` on first `make` |
+| 1 | `ZSTD_PREFIX=/path` set | Custom installation |
+| 2 | *(fallback)* | `pkg-config libzstd` → bare `-lzstd` (system package) |
 
 ### SQLite (three-tier)
 

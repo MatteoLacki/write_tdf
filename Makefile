@@ -9,19 +9,17 @@ TEST_OUT := /tmp/pmsms2tdf_roundtrip.d
 TDF_SRC  := tests/F9477.d
 
 # ---------------------------------------------------------------------------
-# zstd: vendored by default; override with ZSTD_PREFIX=/path for system/custom zstd
+# zstd: system by default; override with ZSTD_PREFIX=/path for custom install
 # ---------------------------------------------------------------------------
-ZSTD_VERSION := 1.5.6
-ZSTD_SRC     := src/zstd_bundled/zstd-$(ZSTD_VERSION)
-
 ifdef ZSTD_PREFIX
   ZSTD_CFLAGS := -I$(ZSTD_PREFIX)/include
   ZSTD_LIBS   := -L$(ZSTD_PREFIX)/lib -lzstd
-  ZSTD_DEPS   :=
 else
-  ZSTD_CFLAGS := -I$(ZSTD_SRC)/lib
-  ZSTD_LIBS   := $(ZSTD_SRC)/lib/libzstd.a
-  ZSTD_DEPS   := $(ZSTD_SRC)/lib/libzstd.a
+  ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
+  ZSTD_LIBS   := $(shell pkg-config --libs   libzstd 2>/dev/null)
+endif
+ifeq ($(ZSTD_LIBS),)
+  ZSTD_LIBS := -lzstd
 endif
 
 CXXFLAGS += $(ZSTD_CFLAGS)
@@ -65,7 +63,7 @@ LDFLAGS  += $(SQLITE3_LIBS)
 # Targets
 # ---------------------------------------------------------------------------
 
-pmsms2tdf: main.o $(ZSTD_DEPS) $(AMALGAMATION_DEPS)
+pmsms2tdf: main.o $(AMALGAMATION_DEPS)
 	$(CXX) $^ -o $@ $(LDFLAGS)
 
 main.o: main.cpp
@@ -74,14 +72,6 @@ main.o: main.cpp
 src/sqlite_amalgamation/sqlite3.o: src/sqlite_amalgamation/sqlite3.c
 	$(CC) -O2 -c $< -o $@
 
-$(ZSTD_SRC)/lib/libzstd.a: | src/zstd_bundled
-	curl -fsSL \
-	  https://github.com/facebook/zstd/releases/download/v$(ZSTD_VERSION)/zstd-$(ZSTD_VERSION).tar.gz \
-	  | tar -xz -C src/zstd_bundled
-	$(MAKE) -C $(ZSTD_SRC) lib/libzstd.a CC=$(CC)
-
-src/zstd_bundled:
-	mkdir -p $@
 
 test: pmsms2tdf
 	rm -rf $(TEST_OUT)

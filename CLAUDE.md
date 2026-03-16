@@ -5,6 +5,14 @@ complete Bruker `.d` folder containing `analysis.tdf_bin` (ZSTD-compressed frame
 binary) and `analysis.tdf` (SQLite metadata), ready for downstream tools like
 OpenTIMS or Bruker DataAnalysis.
 
+> **Note for AI assistants:** This file is the authoritative reference for the
+> `write_tdf` sub-project. A higher-level summary of this tool also exists in
+> `../../CLAUDE.md` (two directories up, at the `massimo_pipeline` repo root).
+> When making changes here that affect the build system, dependencies, CLI
+> interface, or key file list, consider whether the corresponding section in
+> `../../CLAUDE.md` needs updating too — but only propagate changes if the user
+> explicitly approves.
+
 ---
 
 ## Repository layout
@@ -37,7 +45,7 @@ write_tdf/
 | Dependency | How resolved |
 |------------|-------------|
 | **mmappet.h** | Three-tier: `MMAPPET_H=/path/to/mmappet.h` env var → sibling repo `../mmappet/src/mmappet/cpp/mmappet/mmappet.h` (auto-detected via `$(wildcard ...)`) → bundled `src/mmappet.h`. |
-| **zstd** | Vendored by default: downloads `zstd-1.5.6.tar.gz` from GitHub on first `make`, builds `src/zstd_bundled/zstd-1.5.6/lib/libzstd.a`. Override with `ZSTD_PREFIX=/path` to use a system/custom zstd instead. |
+| **zstd** | System by default: `ZSTD_PREFIX=/path` → `pkg-config libzstd` → bare `-lzstd`. Requires `libzstd-dev` (or equivalent) to be installed. |
 | **SQLite** | Three-tier: `SQLITE3_PREFIX` env var → `pkg-config sqlite3` → amalgamation (`src/sqlite_amalgamation/`). |
 | **pthreads** | System library, always linked via `-lpthread`. |
 
