@@ -22,8 +22,8 @@ struct AnalysisTdfConfig {
     std::optional<double> T1;
     std::optional<double> T2;
     std::optional<double> pressure;
-    double accumulation_time_ms   = 100.0;
-    double ramp_time_ms           = 100.0;
+    double accumulation_time_ms = 100.0;   // fixed reference: SDK scales by 100/accum_ms
+    double ramp_time_ms         = 100.0;   // keep symmetric with accumulation_time_ms
     int    denoised               = 0;
     int    mz_calibration         = 1;
     char   polarity               = '+';
@@ -146,9 +146,15 @@ inline int write_analysis_tdf(
     if (!exec("BEGIN;"))                   return 1;
 
     // -----------------------------------------------------------------------
-    // 3. Read defaults (T1, T2, Pressure) from template Frames table
+    // 3. Read defaults (T1, T2, Pressure) from template Frames table.
+    //    AccumulationTime/RampTime are NOT taken from the template: 100 ms is
+    //    used as the fixed reference so that the Bruker SDK intensity scaling
+    //    factor (100/accum_ms) is always 1× — stored and read-back intensities
+    //    are identical regardless of the original acquisition timing.
     // -----------------------------------------------------------------------
     double T1 = 25.0, T2 = 25.0, pressure_val = 0.0;
+    double accum_ms = cfg.accumulation_time_ms;
+    double ramp_ms  = cfg.ramp_time_ms;
     {
         sqlite3_stmt* s = nullptr;
         if (sqlite3_prepare_v2(db,
@@ -224,7 +230,7 @@ inline int write_analysis_tdf(
         }
 
         uint32_t first_fid = frame_index.empty() ? 1u : frame_index.front().frame_id;
-        double   period_s  = (cfg.accumulation_time_ms + cfg.ramp_time_ms) / 1000.0;
+        double   period_s  = (accum_ms + ramp_ms) / 1000.0;
         const char* pol_str = (cfg.polarity == '-') ? "-" : "+";
 
         for (size_t i = 0; i < frame_index.size(); ++i) {
@@ -247,8 +253,8 @@ inline int write_analysis_tdf(
             sqlite3_bind_double(s, 13, T2);
             sqlite3_bind_int   (s, 14, 1);   // TimsCalibration FK
             sqlite3_bind_int   (s, 15, 1);   // PropertyGroup FK
-            sqlite3_bind_double(s, 16, cfg.accumulation_time_ms);
-            sqlite3_bind_double(s, 17, cfg.ramp_time_ms);
+            sqlite3_bind_double(s, 16, accum_ms);
+            sqlite3_bind_double(s, 17, ramp_ms);
             sqlite3_bind_double(s, 18, pressure_val);
             sqlite3_bind_int   (s, 19, cfg.denoised);
 

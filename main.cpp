@@ -154,6 +154,7 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--ramp-time") {
             char* end;
             cfg.atdf_cfg.ramp_time_ms = strtod(need_value("--ramp-time"), &end);
+
         } else if (arg == "--denoised") {
             char* end;
             cfg.atdf_cfg.denoised = (int)strtol(need_value("--denoised"), &end, 10);
