@@ -1,7 +1,7 @@
 #include "tdf_writer.h"
 #include "mmappet.h"
 #include <iostream>
-#include <print>
+#include <format>
 #include <filesystem>
 #include <vector>
 #include <optional>
@@ -46,7 +46,7 @@ struct Config {
 // ---------------------------------------------------------------------------
 
 [[noreturn]] static void usage(const char* prog, int code) {
-    std::print(stderr,
+    std::cerr << std::format(
         "pmsms2tdf -- convert MS1/MS2 mmappet event data into a Bruker timsTOF .d folder.\n"
         "\n"
         "Reads two columnar memory-mapped datasets (MS1 and MS2), merges their frame\n"
@@ -274,7 +274,7 @@ static std::vector<FrameEntry> build_frame_index(
         take_ms1 ? ++i : ++j;
     }
 
-    std::print("frames built: {}\n", idx.size());
+    std::cout << std::format("frames built: {}\n", idx.size());
     return idx;
 }
 
@@ -287,17 +287,17 @@ static void print_frame_index(const std::vector<FrameEntry>& frame_index) {
     size_t n = frame_index.size();
     size_t head = std::min(n, size_t(10));
     size_t tail_start = std::max(head, n > 10 ? n - 10 : n);
-    std::print("frame_index:\n");
+    std::cout << "frame_index:\n";
     for (size_t k = 0; k < head; ++k) {
         const FrameEntry& fe = frame_index[k];
         const char* src = (fe.source == MS1) ? "ms1" : (fe.source == MS2) ? "ms2" : "empty";
-        std::print("  [{}] frame={}  src={}  rows=[{},{})\n", k, fe.frame_id, src, fe.start, fe.end);
+        std::cout << std::format("  [{}] frame={}  src={}  rows=[{},{})\n", k, fe.frame_id, src, fe.start, fe.end);
     }
-    if (tail_start > head) std::print("  ...\n");
+    if (tail_start > head) std::cout << "  ...\n";
     for (size_t k = tail_start; k < n; ++k) {
         const FrameEntry& fe = frame_index[k];
         const char* src = (fe.source == MS1) ? "ms1" : (fe.source == MS2) ? "ms2" : "empty";
-        std::print("  [{}] frame={}  src={}  rows=[{},{})\n", k, fe.frame_id, src, fe.start, fe.end);
+        std::cout << std::format("  [{}] frame={}  src={}  rows=[{},{})\n", k, fe.frame_id, src, fe.start, fe.end);
     }
 }
 
@@ -310,14 +310,14 @@ static void print_dry_run(
     const MMappedData<uint32_t>& ms2_tofs,
     const MMappedData<uint32_t>& ms2_ints)
 {
-    std::print("frame\tscan\ttof\tintensity\n");
+    std::cout << "frame\tscan\ttof\tintensity\n";
     for (const auto& fe : frame_index) {
         if (fe.source == EMPTY) continue;
         const auto* scans_col = (fe.source == MS1) ? &ms1_scans : &ms2_scans;
         const auto* tofs_col  = (fe.source == MS1) ? &ms1_tofs  : &ms2_tofs;
         const auto* ints_col  = (fe.source == MS1) ? &ms1_ints  : &ms2_ints;
         for (size_t i = fe.start; i < fe.end; ++i)
-            std::print("{}\t{}\t{}\t{}\n", fe.frame_id, (*scans_col)[i], (*tofs_col)[i], (*ints_col)[i]);
+            std::cout << std::format("{}\t{}\t{}\t{}\n", fe.frame_id, (*scans_col)[i], (*tofs_col)[i], (*ints_col)[i]);
     }
 }
 
@@ -498,7 +498,7 @@ static int write_tdf(
             std::filesystem::remove_all(bin_paths[k].parent_path());
     }
 
-    if (verbose) std::print("wrote {} frames to {}\n",
+    if (verbose) std::cout << std::format("wrote {} frames to {}\n",
                             n_frames,
                             (output_dir / "analysis.tdf_bin").string());
     return 0;
@@ -538,8 +538,8 @@ int main(int argc, char** argv) {
         if (fe.source == MS2) ms2_events = std::max(ms2_events, fe.end);
     }
     if (cfg.verbose){
-        std::print("ms1 events used: {} / {}\n", ms1_events, ms1_frames.size());
-        std::print("ms2 events used: {} / {}\n", ms2_events, ms2_frames.size());
+        std::cout << std::format("ms1 events used: {} / {}\n", ms1_events, ms1_frames.size());
+        std::cout << std::format("ms2 events used: {} / {}\n", ms2_events, ms2_frames.size());
     }
 
     uint32_t max_scan = 0;
@@ -548,7 +548,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < ms2_events; ++i)
         if (ms2_scans[i] > max_scan) max_scan = ms2_scans[i];
     uint32_t total_scans = (ms1_events + ms2_events > 0) ? max_scan + 1 : 0;
-    if (cfg.verbose) std::print("total_scans: {}\n", total_scans);
+    if (cfg.verbose) std::cout << std::format("total_scans: {}\n", total_scans);
 
     // -----------------------------------------------------------------------
     // Dry-run: print events in the order they would be written

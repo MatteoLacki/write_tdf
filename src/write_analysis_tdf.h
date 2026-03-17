@@ -10,7 +10,8 @@
 #include <optional>
 #include <array>
 #include <set>
-#include <print>
+#include <iostream>
+#include <format>
 
 #include "mmappet.h"
 
@@ -111,7 +112,7 @@ inline int write_analysis_tdf(
     std::error_code ec;
     fs::copy_file(tdf_src, out_tdf, fs::copy_options::overwrite_existing, ec);
     if (ec) {
-        std::print(stderr, "write_analysis_tdf: copy {} -> {} failed: {}\n",
+        std::cerr << std::format("write_analysis_tdf: copy {} -> {} failed: {}\n",
                    tdf_src.string(), out_tdf.string(), ec.message());
         return 1;
     }
@@ -121,7 +122,7 @@ inline int write_analysis_tdf(
     // -----------------------------------------------------------------------
     sqlite3* db_raw = nullptr;
     if (sqlite3_open(out_tdf.c_str(), &db_raw) != SQLITE_OK) {
-        std::print(stderr, "write_analysis_tdf: cannot open {}: {}\n",
+        std::cerr << std::format("write_analysis_tdf: cannot open {}: {}\n",
                    out_tdf.string(), sqlite3_errmsg(db_raw));
         sqlite3_close(db_raw);
         return 1;
@@ -134,7 +135,7 @@ inline int write_analysis_tdf(
         char* err = nullptr;
         int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
         if (rc != SQLITE_OK) {
-            std::print(stderr, "SQL error: {}\n  SQL: {}\n",
+            std::cerr << std::format("SQL error: {}\n  SQL: {}\n",
                        err ? err : sqlite3_errmsg(db), sql);
             sqlite3_free(err);
             return false;
@@ -224,7 +225,7 @@ inline int write_analysis_tdf(
 
         sqlite3_stmt* s = nullptr;
         if (sqlite3_prepare_v2(db, sql, -1, &s, nullptr) != SQLITE_OK) {
-            std::print(stderr, "prepare INSERT Frames: {}\n", sqlite3_errmsg(db));
+            std::cerr << std::format("prepare INSERT Frames: {}\n", sqlite3_errmsg(db));
             free_props(ms1_props); free_props(ms2_props);
             return 1;
         }
@@ -259,7 +260,7 @@ inline int write_analysis_tdf(
             sqlite3_bind_int   (s, 19, cfg.denoised);
 
             if (sqlite3_step(s) != SQLITE_DONE) {
-                std::print(stderr, "INSERT Frames failed (frame {}): {}\n",
+                std::cerr << std::format("INSERT Frames failed (frame {}): {}\n",
                            fe.frame_id, sqlite3_errmsg(db));
                 sqlite3_finalize(s);
                 free_props(ms1_props); free_props(ms2_props);
@@ -280,7 +281,7 @@ inline int write_analysis_tdf(
         if (sqlite3_prepare_v2(db,
                 "INSERT INTO FrameProperties (Frame, Property, Value) VALUES (?,?,?)",
                 -1, &s, nullptr) != SQLITE_OK) {
-            std::print(stderr, "prepare INSERT FrameProperties: {}\n", sqlite3_errmsg(db));
+            std::cerr << std::format("prepare INSERT FrameProperties: {}\n", sqlite3_errmsg(db));
             free_props(ms1_props); free_props(ms2_props);
             return 1;
         }
@@ -292,7 +293,7 @@ inline int write_analysis_tdf(
                 sqlite3_bind_int  (s, 2, prop);
                 sqlite3_bind_value(s, 3, val);
                 if (sqlite3_step(s) != SQLITE_DONE) {
-                    std::print(stderr, "INSERT FrameProperties failed: {}\n",
+                    std::cerr << std::format("INSERT FrameProperties failed: {}\n",
                                sqlite3_errmsg(db));
                     sqlite3_finalize(s);
                     free_props(ms1_props); free_props(ms2_props);
@@ -327,7 +328,7 @@ inline int write_analysis_tdf(
             if (sqlite3_prepare_v2(db,
                     "INSERT INTO DiaFrameMsMsInfo (Frame, WindowGroup) VALUES (?,?)",
                     -1, &s, nullptr) != SQLITE_OK) {
-                std::print(stderr, "prepare INSERT DiaFrameMsMsInfo: {}\n",
+                std::cerr << std::format("prepare INSERT DiaFrameMsMsInfo: {}\n",
                            sqlite3_errmsg(db));
                 return 1;
             }
@@ -340,7 +341,7 @@ inline int write_analysis_tdf(
                     sqlite3_bind_int(s, 1, (int)fe.frame_id);
                     sqlite3_bind_int(s, 2, wg);
                     if (sqlite3_step(s) != SQLITE_DONE) {
-                        std::print(stderr, "INSERT DiaFrameMsMsInfo failed: {}\n",
+                        std::cerr << std::format("INSERT DiaFrameMsMsInfo failed: {}\n",
                                    sqlite3_errmsg(db));
                         sqlite3_finalize(s);
                         return 1;
@@ -365,7 +366,7 @@ inline int write_analysis_tdf(
             sqlite3_bind_int(s, 1, (int)frame_index.front().frame_id);
             sqlite3_bind_int(s, 2, (int)frame_index.back().frame_id);
             if (sqlite3_step(s) != SQLITE_DONE)
-                std::print(stderr, "INSERT Segments failed: {}\n", sqlite3_errmsg(db));
+                std::cerr << std::format("INSERT Segments failed: {}\n", sqlite3_errmsg(db));
             sqlite3_finalize(s);
         }
     }
@@ -452,6 +453,6 @@ inline int write_analysis_tdf(
         return 1;
     }
 
-    std::print("wrote analysis.tdf ({} frames)\n", frame_index.size());
+    std::cout << std::format("wrote analysis.tdf ({} frames)\n", frame_index.size());
     return 0;
 }

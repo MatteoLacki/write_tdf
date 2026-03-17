@@ -7,7 +7,7 @@
 #include <span>
 #include <vector>
 #include <iostream>
-#include <print>
+#include <format>
 #include <cassert>
 
 class TdfWriter {
@@ -152,7 +152,7 @@ public:
         out_sum_ints_[frames_written_]  = sum_int;
 
         if (verbose_) {
-            std::print("frame {}  n_events={}  tims_id={}  max_int={}  sum_int={}\n",
+            std::cout << std::format("frame {}  n_events={}  tims_id={}  max_int={}  sum_int={}\n",
                        frame_id, n_events, tims_id, max_int, sum_int);
         }
 
