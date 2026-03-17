@@ -1,3 +1,5 @@
+* Add sqlite.h if possible and check if linking against it completes the roundtrip.
+
 * Write a command line programme pmsms2tdf.
 
 Expected inputs:

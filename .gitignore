@@ -11,7 +11,4 @@ pmsms2mzml
 
 # Ignore all files in tests/
 tests/*
-
-# Re-allow files that have an extension
-!tests/*.*
 pmsms2tdf

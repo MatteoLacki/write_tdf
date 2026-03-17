@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <span>
 #include <vector>
 #include <iostream>
@@ -27,10 +28,12 @@ public:
               std::span<uint32_t> out_max_ints,
               std::span<uint64_t> out_sum_ints,
               bool verbose = false,
-              int  zstd_level = 1)
+              int  zstd_level = 1,
+              double intensity_scale = 1.0)
         : total_scans_(total_scans)
         , verbose_(verbose)
         , zstd_level_(zstd_level)
+        , intensity_scale_(intensity_scale)
         , out_ids_(out_ids)
         , out_tims_ids_(out_tims_ids)
         , out_num_peaks_(out_num_peaks)
@@ -64,15 +67,6 @@ public:
 
         uint64_t tims_id = (uint64_t)ftello(tdf_bin_.get());
 
-        // Intensity statistics
-        uint32_t max_int = 0;
-        uint64_t sum_int = 0;
-        for (size_t i = 0; i < n_events; ++i) {
-            uint32_t iv = intensities[i];
-            if (iv > max_int) max_int = iv;
-            sum_int += iv;
-        }
-
         // Build peak_cnts header
         std::fill(peak_cnts_.begin(), peak_cnts_.end(), 0u);
         peak_cnts_[0] = total_scans_;
@@ -100,11 +94,20 @@ public:
             }
         }
 
-        // Interleave [tof_delta, intensity, ...]
+        // Interleave [tof_delta, intensity, ...], scale intensities, collect stats
         interleaved_.resize(2 * n_events);
+        uint32_t max_int = 0;
+        uint64_t sum_int = 0;
         for (size_t i = 0; i < n_events; ++i) {
+            uint32_t iv = (intensity_scale_ == 1.0)
+                ? intensities[i]
+                : static_cast<uint32_t>(std::min(
+                      (double)intensities[i] * intensity_scale_,
+                      (double)std::numeric_limits<uint32_t>::max()));
+            if (iv > max_int) max_int = iv;
+            sum_int += iv;
             interleaved_[2*i]     = tof_deltas_[i];
-            interleaved_[2*i + 1] = intensities[i];
+            interleaved_[2*i + 1] = iv;
         }
 
         // 4-byte lane transpose into real_data
@@ -163,6 +166,7 @@ private:
     uint32_t total_scans_;
     bool verbose_;
     int zstd_level_;
+    double intensity_scale_;
 
     // Caller-owned metadata spans (one slot per frame this writer handles)
     std::span<uint32_t> out_ids_;
