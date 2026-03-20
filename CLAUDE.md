@@ -230,18 +230,20 @@ writer.write_rows(n, ids, tims_ids, num_peaks, max_ints, sum_ints);
 ## CLI reference
 
 ```
-./pmsms2tdf --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>
+./pmsms2tdf [--ms1 <ms1.mmappet>] [--ms2 <ms2.mmappet>]
+            (at least one of --ms1 / --ms2 required)
             [--output <output.d>] [--tdf <template.d/analysis.tdf>]
             [options]
 ```
 
+`--ms1` and `--ms2` are each optional; at least one must be provided.
 `--output` triggers write mode; omitting it prints events to stdout (dry-run).
 `--tdf` is required when `--output` is given.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--tdf PATH` | (required with --output) | Template `analysis.tdf` |
-| `--drop-metadata` | false | Skip `frames_metadata.mmappet` |
+| `--write-metadata` | false | Write `frames_metadata.mmappet` |
 | `--max-frames N` | all | Cap on merged frame count |
 | `--threads N` | all cores | Parallel writer threads |
 | `--zstd-level N` | 1 | ZSTD compression level (1–22) |

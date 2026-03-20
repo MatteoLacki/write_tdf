@@ -27,11 +27,11 @@ struct FrameEntry { uint32_t frame_id; Source source; size_t start; size_t end; 
 #include "write_analysis_tdf.h"
 
 struct Config {
-    std::filesystem::path ms1_path;
-    std::filesystem::path ms2_path;
+    std::optional<std::filesystem::path> ms1_path;
+    std::optional<std::filesystem::path> ms2_path;
     std::optional<std::filesystem::path> output_dir;  // absent = dry-run
     std::optional<std::filesystem::path> tdf_src;     // template analysis.tdf
-    bool drop_metadata = false;
+    bool write_metadata = false;
     size_t max_frames = SIZE_MAX;
     size_t threads = std::thread::hardware_concurrency();
     int zstd_level = 1;
@@ -49,21 +49,22 @@ struct Config {
     std::cerr << std::format(
         "pmsms2tdf -- convert MS1/MS2 mmappet event data into a Bruker timsTOF .d folder.\n"
         "\n"
-        "Reads two columnar memory-mapped datasets (MS1 and MS2), merges their frame\n"
-        "sequences, fills any gaps with empty frames, encodes each frame as a\n"
+        "Reads one or two columnar memory-mapped datasets (MS1 and/or MS2), merges their\n"
+        "frame sequences, fills any gaps with empty frames, encodes each frame as a\n"
         "ZSTD-compressed binary block (analysis.tdf_bin), and writes the accompanying\n"
         "SQLite metadata (analysis.tdf) by repopulating a user-supplied template.\n"
         "The output .d folder can be opened directly by OpenTIMS, Bruker DataAnalysis,\n"
         "or any other tool that reads the timsTOF data format.\n"
         "\n"
-        "Usage: {} --ms1 <ms1.mmappet> --ms2 <ms2.mmappet>"
-        " [--output <output.d/>] [--tdf <analysis.tdf>] [options]\n"
+        "Usage: {} [--ms1 <ms1.mmappet>] [--ms2 <ms2.mmappet>]\n"
+        "         (at least one of --ms1 / --ms2 required)\n"
+        "         [--output <output.d/>] [--tdf <analysis.tdf>] [options]\n"
         "\n"
-        "  --ms1 PATH           input MS1 mmappet (frame/scan/tof/intensity)\n"
-        "  --ms2 PATH           input MS2 mmappet (frame/scan/tof/intensity)\n"
+        "  --ms1 PATH           input MS1 mmappet (frame/scan/tof/intensity); optional\n"
+        "  --ms2 PATH           input MS2 mmappet (frame/scan/tof/intensity); optional\n"
         "  --output PATH        output .d directory; omit to print events instead of writing\n"
         "  --tdf PATH           source analysis.tdf template to copy (required with --output)\n"
-        "  --drop-metadata      skip writing frames_metadata.mmappet\n"
+        "  --write-metadata     write frames_metadata.mmappet\n"
         "  --max-frames N       cap on merged+gap-filled frame sequence (default: all)\n"
         "  --threads N          number of parallel writer threads (default: all cores)\n"
         "  --zstd-level N       ZSTD compression level 1-22 (default: 1)\n"
@@ -109,8 +110,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.output_dir = need_value("--output");
         } else if (arg == "--tdf") {
             cfg.tdf_src = need_value("--tdf");
-        } else if (arg == "--drop-metadata") {
-            cfg.drop_metadata = true;
+        } else if (arg == "--write-metadata") {
+            cfg.write_metadata = true;
         } else if (arg == "--max-frames") {
             char* end;
             unsigned long long v = strtoull(need_value("--max-frames"), &end, 10);
@@ -202,8 +203,8 @@ static Config parse_args(int argc, char** argv) {
         }
     }
 
-    if (!have_ms1 || !have_ms2) {
-        std::cerr << "Error: --ms1 and --ms2 are required\n";
+    if (!have_ms1 && !have_ms2) {
+        std::cerr << "Error: at least one of --ms1 or --ms2 is required\n";
         usage(argv[0], 1);
     }
     if (cfg.output_dir && !cfg.tdf_src) {
@@ -303,21 +304,21 @@ static void print_frame_index(const std::vector<FrameEntry>& frame_index) {
 
 static void print_dry_run(
     const std::vector<FrameEntry>& frame_index,
-    const MMappedData<uint32_t>& ms1_scans,
-    const MMappedData<uint32_t>& ms1_tofs,
-    const MMappedData<uint32_t>& ms1_ints,
-    const MMappedData<uint32_t>& ms2_scans,
-    const MMappedData<uint32_t>& ms2_tofs,
-    const MMappedData<uint32_t>& ms2_ints)
+    std::span<const uint32_t> ms1_scans,
+    std::span<const uint32_t> ms1_tofs,
+    std::span<const uint32_t> ms1_ints,
+    std::span<const uint32_t> ms2_scans,
+    std::span<const uint32_t> ms2_tofs,
+    std::span<const uint32_t> ms2_ints)
 {
     std::cout << "frame\tscan\ttof\tintensity\n";
     for (const auto& fe : frame_index) {
         if (fe.source == EMPTY) continue;
-        const auto* scans_col = (fe.source == MS1) ? &ms1_scans : &ms2_scans;
-        const auto* tofs_col  = (fe.source == MS1) ? &ms1_tofs  : &ms2_tofs;
-        const auto* ints_col  = (fe.source == MS1) ? &ms1_ints  : &ms2_ints;
+        std::span<const uint32_t> scans = (fe.source == MS1) ? ms1_scans : ms2_scans;
+        std::span<const uint32_t> tofs  = (fe.source == MS1) ? ms1_tofs  : ms2_tofs;
+        std::span<const uint32_t> ints  = (fe.source == MS1) ? ms1_ints  : ms2_ints;
         for (size_t i = fe.start; i < fe.end; ++i)
-            std::cout << std::format("{}\t{}\t{}\t{}\n", fe.frame_id, (*scans_col)[i], (*tofs_col)[i], (*ints_col)[i]);
+            std::cout << std::format("{}\t{}\t{}\t{}\n", fe.frame_id, scans[i], tofs[i], ints[i]);
     }
 }
 
@@ -381,12 +382,12 @@ static bool append_file(FILE* dst, const std::filesystem::path& src, bool use_fr
 static int write_tdf(
     const std::filesystem::path& output_dir,
     const std::vector<FrameEntry>& frame_index,
-    const MMappedData<uint32_t>& ms1_scans,
-    const MMappedData<uint32_t>& ms1_tofs,
-    const MMappedData<uint32_t>& ms1_ints,
-    const MMappedData<uint32_t>& ms2_scans,
-    const MMappedData<uint32_t>& ms2_tofs,
-    const MMappedData<uint32_t>& ms2_ints,
+    std::span<const uint32_t> ms1_scans,
+    std::span<const uint32_t> ms1_tofs,
+    std::span<const uint32_t> ms1_ints,
+    std::span<const uint32_t> ms2_scans,
+    std::span<const uint32_t> ms2_tofs,
+    std::span<const uint32_t> ms2_ints,
     uint32_t total_scans,
     bool verbose,
     size_t threads,
@@ -512,21 +513,35 @@ static int write_tdf(
 int main(int argc, char** argv) {
     Config cfg = parse_args(argc, argv);
 
-    // Open columns
-    auto ms1_frames = OpenColumn<uint32_t>(cfg.ms1_path, "frame");
-    auto ms1_scans  = OpenColumn<uint32_t>(cfg.ms1_path, "scan");
-    auto ms1_tofs   = OpenColumn<uint32_t>(cfg.ms1_path, "tof");
-    auto ms1_ints   = OpenColumn<uint32_t>(cfg.ms1_path, "intensity");
+    // Open columns (conditionally — each source is optional)
+    std::optional<MMappedData<uint32_t>> ms1_frames_mm, ms1_scans_mm, ms1_tofs_mm, ms1_ints_mm;
+    std::span<const uint32_t> ms1_frames_sp, ms1_scans_sp, ms1_tofs_sp, ms1_ints_sp;
+    if (cfg.ms1_path) {
+        ms1_frames_mm.emplace(OpenColumn<uint32_t>(*cfg.ms1_path, "frame"));
+        ms1_scans_mm .emplace(OpenColumn<uint32_t>(*cfg.ms1_path, "scan"));
+        ms1_tofs_mm  .emplace(OpenColumn<uint32_t>(*cfg.ms1_path, "tof"));
+        ms1_ints_mm  .emplace(OpenColumn<uint32_t>(*cfg.ms1_path, "intensity"));
+        ms1_frames_sp = {ms1_frames_mm->data(), ms1_frames_mm->size()};
+        ms1_scans_sp  = {ms1_scans_mm ->data(), ms1_scans_mm ->size()};
+        ms1_tofs_sp   = {ms1_tofs_mm  ->data(), ms1_tofs_mm  ->size()};
+        ms1_ints_sp   = {ms1_ints_mm  ->data(), ms1_ints_mm  ->size()};
+    }
 
-    auto ms2_frames = OpenColumn<uint32_t>(cfg.ms2_path, "frame");
-    auto ms2_scans  = OpenColumn<uint32_t>(cfg.ms2_path, "scan");
-    auto ms2_tofs   = OpenColumn<uint32_t>(cfg.ms2_path, "tof");
-    auto ms2_ints   = OpenColumn<uint32_t>(cfg.ms2_path, "intensity");
+    std::optional<MMappedData<uint32_t>> ms2_frames_mm, ms2_scans_mm, ms2_tofs_mm, ms2_ints_mm;
+    std::span<const uint32_t> ms2_frames_sp, ms2_scans_sp, ms2_tofs_sp, ms2_ints_sp;
+    if (cfg.ms2_path) {
+        ms2_frames_mm.emplace(OpenColumn<uint32_t>(*cfg.ms2_path, "frame"));
+        ms2_scans_mm .emplace(OpenColumn<uint32_t>(*cfg.ms2_path, "scan"));
+        ms2_tofs_mm  .emplace(OpenColumn<uint32_t>(*cfg.ms2_path, "tof"));
+        ms2_ints_mm  .emplace(OpenColumn<uint32_t>(*cfg.ms2_path, "intensity"));
+        ms2_frames_sp = {ms2_frames_mm->data(), ms2_frames_mm->size()};
+        ms2_scans_sp  = {ms2_scans_mm ->data(), ms2_scans_mm ->size()};
+        ms2_tofs_sp   = {ms2_tofs_mm  ->data(), ms2_tofs_mm  ->size()};
+        ms2_ints_sp   = {ms2_ints_mm  ->data(), ms2_ints_mm  ->size()};
+    }
 
     std::vector<FrameEntry> frame_index = build_frame_index(
-        {ms1_frames.data(), ms1_frames.size()},
-        {ms2_frames.data(), ms2_frames.size()},
-        cfg.max_frames);
+        ms1_frames_sp, ms2_frames_sp, cfg.max_frames);
 
     if (cfg.verbose)
         print_frame_index(frame_index);
@@ -538,15 +553,15 @@ int main(int argc, char** argv) {
         if (fe.source == MS2) ms2_events = std::max(ms2_events, fe.end);
     }
     if (cfg.verbose){
-        std::cout << std::format("ms1 events used: {} / {}\n", ms1_events, ms1_frames.size());
-        std::cout << std::format("ms2 events used: {} / {}\n", ms2_events, ms2_frames.size());
+        std::cout << std::format("ms1 events used: {} / {}\n", ms1_events, ms1_frames_sp.size());
+        std::cout << std::format("ms2 events used: {} / {}\n", ms2_events, ms2_frames_sp.size());
     }
 
     uint32_t max_scan = 0;
     for (size_t i = 0; i < ms1_events; ++i)
-        if (ms1_scans[i] > max_scan) max_scan = ms1_scans[i];
+        if (ms1_scans_sp[i] > max_scan) max_scan = ms1_scans_sp[i];
     for (size_t i = 0; i < ms2_events; ++i)
-        if (ms2_scans[i] > max_scan) max_scan = ms2_scans[i];
+        if (ms2_scans_sp[i] > max_scan) max_scan = ms2_scans_sp[i];
     uint32_t total_scans = (ms1_events + ms2_events > 0) ? max_scan + 1 : 0;
     if (cfg.verbose) std::cout << std::format("total_scans: {}\n", total_scans);
 
@@ -554,7 +569,9 @@ int main(int argc, char** argv) {
     // Dry-run: print events in the order they would be written
     // -----------------------------------------------------------------------
     if (!cfg.output_dir) {
-        print_dry_run(frame_index, ms1_scans, ms1_tofs, ms1_ints, ms2_scans, ms2_tofs, ms2_ints);
+        print_dry_run(frame_index,
+            ms1_scans_sp, ms1_tofs_sp, ms1_ints_sp,
+            ms2_scans_sp, ms2_tofs_sp, ms2_ints_sp);
         return 0;
     }
 
@@ -564,8 +581,8 @@ int main(int argc, char** argv) {
     int rc = write_tdf(
         *cfg.output_dir,
         frame_index,
-        ms1_scans, ms1_tofs, ms1_ints,
-        ms2_scans, ms2_tofs, ms2_ints,
+        ms1_scans_sp, ms1_tofs_sp, ms1_ints_sp,
+        ms2_scans_sp, ms2_tofs_sp, ms2_ints_sp,
         total_scans,
         cfg.verbose,
         cfg.threads,
@@ -582,7 +599,7 @@ int main(int argc, char** argv) {
         if (rc != 0) return rc;
     }
 
-    if (!cfg.drop_metadata) {
+    if (cfg.write_metadata) {
         auto meta = Schema<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>(
             "Id", "TimsId", "NumPeaks", "MaxIntensity", "SummedIntensities"
         ).create_writer(*cfg.output_dir / "frames_metadata.mmappet");
