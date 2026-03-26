@@ -239,7 +239,8 @@ static void collect_frame_entries(
 static std::vector<FrameEntry> build_frame_index(
     std::span<const uint32_t> ms1_frames,
     std::span<const uint32_t> ms2_frames,
-    size_t max_frames)
+    size_t max_frames,
+    Source gap_source = EMPTY)
 {
     std::vector<FrameEntry> ms1_entries, ms2_entries;
     collect_frame_entries(ms1_frames, MS1, ms1_entries);
@@ -268,7 +269,7 @@ static std::vector<FrameEntry> build_frame_index(
         // Fill gap before this entry
         uint32_t prev_fid = idx.empty() ? fe.frame_id : idx.back().frame_id;
         for (uint32_t fid = prev_fid + 1; fid < fe.frame_id && idx.size() < max_frames; ++fid)
-            idx.push_back({fid, EMPTY, 0, 0});
+            idx.push_back({fid, gap_source, 0, 0});
 
         if (idx.size() < max_frames)
             idx.push_back(fe);
@@ -540,8 +541,11 @@ int main(int argc, char** argv) {
         ms2_ints_sp   = {ms2_ints_mm  ->data(), ms2_ints_mm  ->size()};
     }
 
+    Source gap_source = EMPTY;
+    if (!cfg.ms2_path.has_value() && cfg.ms1_path.has_value())  gap_source = MS2;
+    if (!cfg.ms1_path.has_value() && cfg.ms2_path.has_value())  gap_source = MS1;
     std::vector<FrameEntry> frame_index = build_frame_index(
-        ms1_frames_sp, ms2_frames_sp, cfg.max_frames);
+        ms1_frames_sp, ms2_frames_sp, cfg.max_frames, gap_source);
 
     if (cfg.verbose)
         print_frame_index(frame_index);
