@@ -133,15 +133,15 @@ find_cluster_runs(const uint32_t* ids, size_t n)
     return runs;
 }
 
-// Clip run [start, end) to the frame range [frame_lo, frame_hi).
+// Clip run [start, end) to the frame range [frame_begin, frame_end).
 // Exploits the fact that frames within a run are sorted ascending.
 static std::pair<size_t, size_t>
 clip_run(const uint32_t* frames, size_t start, size_t end,
-         uint32_t frame_lo, uint32_t frame_hi)
+         uint32_t frame_begin, uint32_t frame_end)
 {
-    size_t sub_start = (size_t)(std::lower_bound(frames + start, frames + end, frame_lo) - frames);
-    size_t sub_end   = (size_t)(std::lower_bound(frames + start, frames + end, frame_hi) - frames);
-    return {sub_start, sub_end};
+    size_t clip_begin = (size_t)(std::lower_bound(frames + start, frames + end, frame_begin) - frames);
+    size_t clip_end   = (size_t)(std::lower_bound(frames + start, frames + end, frame_end)   - frames);
+    return {clip_begin, clip_end};
 }
 
 // ---------------------------------------------------------------------------
@@ -154,16 +154,16 @@ static void merge_worker(
     const uint32_t* tofs,
     const uint32_t* intensities,
     const std::vector<std::pair<size_t, size_t>>& runs,
-    uint32_t frame_lo,
-    uint32_t frame_hi,
+    uint32_t frame_begin,
+    uint32_t frame_end,
     const fs::path& tmp_dir)
 {
-    // Clip each run to [frame_lo, frame_hi); collect non-empty sub-cursors.
+    // Clip each run to [frame_begin, frame_end); collect non-empty sub-cursors.
     std::vector<RunCursor> cursors;
     for (auto [start, end] : runs) {
-        auto [sub_start, sub_end] = clip_run(frames, start, end, frame_lo, frame_hi);
-        if (sub_start < sub_end)
-            cursors.push_back({frames, scans, tofs, intensities, sub_start, sub_end});
+        auto [clip_begin, clip_end] = clip_run(frames, start, end, frame_begin, frame_end);
+        if (clip_begin < clip_end)
+            cursors.push_back({frames, scans, tofs, intensities, clip_begin, clip_end});
     }
 
     // Always create the writer so the column files exist for concatenation.
@@ -178,47 +178,47 @@ static void merge_worker(
     constexpr size_t BATCH = 1 << 16;  // 64 K rows ≈ 1 MB per column buffer
     std::vector<uint32_t> buf_frame(BATCH), buf_scan(BATCH),
                           buf_tof(BATCH),   buf_int(BATCH);
-    size_t buf_pos = 0;
+    size_t n_buffered = 0;
 
     auto flush = [&]() {
-        if (buf_pos == 0) return;
-        writer.write_rows(buf_pos,
+        if (n_buffered == 0) return;
+        writer.write_rows(n_buffered,
                           buf_frame.data(), buf_scan.data(),
                           buf_tof.data(),   buf_int.data());
-        buf_pos = 0;
+        n_buffered = 0;
     };
 
     auto emit = [&](uint32_t f, uint32_t s, uint32_t t, uint32_t iv) {
-        buf_frame[buf_pos] = f;
-        buf_scan [buf_pos] = s;
-        buf_tof  [buf_pos] = t;
-        buf_int  [buf_pos] = iv;
-        if (++buf_pos == BATCH) flush();
+        buf_frame[n_buffered] = f;
+        buf_scan [n_buffered] = s;
+        buf_tof  [n_buffered] = t;
+        buf_int  [n_buffered] = iv;
+        if (++n_buffered == BATCH) flush();
     };
 
-    uint32_t prev_f = 0, prev_s = 0, prev_t = 0;
+    uint32_t prev_frame = 0, prev_scan = 0, prev_tof = 0;
     uint64_t accum = 0;
     bool first = true;
 
     while (!tree.empty()) {
         RunCursor& c = tree.top();
-        uint32_t f = c.frame(), s = c.scan(), t = c.tof(), iv = c.intensity();
+        uint32_t frame = c.frame(), scan = c.scan(), tof = c.tof(), iv = c.intensity();
         tree.pop();
 
-        if (!first && f == prev_f && s == prev_s && t == prev_t) {
+        if (!first && frame == prev_frame && scan == prev_scan && tof == prev_tof) {
             accum += iv;
         } else {
             if (!first)
-                emit(prev_f, prev_s, prev_t,
+                emit(prev_frame, prev_scan, prev_tof,
                      (uint32_t)std::min(accum, (uint64_t)UINT32_MAX));
-            prev_f = f;  prev_s = s;  prev_t = t;
+            prev_frame = frame;  prev_scan = scan;  prev_tof = tof;
             accum  = iv;
             first  = false;
         }
     }
 
     if (!first)
-        emit(prev_f, prev_s, prev_t,
+        emit(prev_frame, prev_scan, prev_tof,
              (uint32_t)std::min(accum, (uint64_t)UINT32_MAX));
     flush();
 }
@@ -281,23 +281,23 @@ int main(int argc, char* argv[])
     auto runs = find_cluster_runs(cluster_ids, n);
 
     // Find global frame range from per-run min/max — O(K), not O(N).
-    uint32_t global_min = UINT32_MAX, global_max = 0;
+    uint32_t first_frame = UINT32_MAX, last_frame = 0;
     for (auto [start, end] : runs) {
-        global_min = std::min(global_min, frames[start]);
-        global_max = std::max(global_max, frames[end - 1]);
+        first_frame = std::min(first_frame, frames[start]);
+        last_frame  = std::max(last_frame,  frames[end - 1]);
     }
 
     // Cap thread count to the number of distinct frames.
-    n_threads = std::min(n_threads, (size_t)(global_max - global_min + 1));
+    n_threads = std::min(n_threads, (size_t)(last_frame - first_frame + 1));
 
-    // Divide frame space [global_min, global_max] into n_threads equal ranges.
-    uint64_t span = (uint64_t)global_max - global_min + 1;
-    std::vector<uint32_t> flo(n_threads), fhi(n_threads);
+    // Divide frame space [first_frame, last_frame] into n_threads equal ranges.
+    uint64_t span = (uint64_t)last_frame - first_frame + 1;
+    std::vector<uint32_t> frame_begins(n_threads), frame_ends(n_threads);
     for (size_t t = 0; t < n_threads; ++t) {
-        flo[t] = global_min + (uint32_t)(t * span / n_threads);
-        fhi[t] = (t + 1 == n_threads)
-                 ? global_max + 1
-                 : global_min + (uint32_t)((t + 1) * span / n_threads);
+        frame_begins[t] = first_frame + (uint32_t)(t * span / n_threads);
+        frame_ends[t]   = (t + 1 == n_threads)
+                          ? last_frame + 1
+                          : first_frame + (uint32_t)((t + 1) * span / n_threads);
     }
 
     // Launch one thread per frame range.
@@ -311,7 +311,7 @@ int main(int argc, char* argv[])
             workers.emplace_back([&, t]() {
                 try {
                     merge_worker(frames, scans, tofs, intensities, runs,
-                                 flo[t], fhi[t], tmp_dirs[t]);
+                                 frame_begins[t], frame_ends[t], tmp_dirs[t]);
                 } catch (const std::exception& e) {
                     std::cerr << "Thread " << t << " error: " << e.what() << "\n";
                     had_error.store(true, std::memory_order_relaxed);
