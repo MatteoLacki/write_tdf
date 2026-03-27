@@ -69,6 +69,12 @@ pmsms2tdf: main.o $(AMALGAMATION_DEPS)
 main.o: main.cpp
 	$(CXX) $(CXXFLAGS) -c $<
 
+mmappet-merge-dedup: merge_main.o
+	$(CXX) $^ -o $@ -lpthread
+
+merge_main.o: merge_main.cpp src/loser_tree.h
+	$(CXX) $(CXXFLAGS) -c $<
+
 src/sqlite_amalgamation/sqlite3.o: src/sqlite_amalgamation/sqlite3.c
 	$(CC) -O2 -c $< -o $@
 

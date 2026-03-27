@@ -19,11 +19,13 @@ OpenTIMS or Bruker DataAnalysis.
 
 ```
 write_tdf/
-├── main.cpp                        # CLI, frame index, multi-threaded orchestration
+├── main.cpp                        # CLI, frame index, multi-threaded orchestration (pmsms2tdf)
+├── merge_main.cpp                  # CLI, multithreaded K-way merge + dedup (mmappet-merge-dedup)
 ├── src/
 │   ├── tdf_writer.h                # TdfWriter: ZSTD frame encoder
 │   ├── write_analysis_tdf.h        # write_analysis_tdf(): SQLite metadata writer
 │   ├── mmappet.h                   # header-only memory-mapped column reader/writer
+│   ├── loser_tree.h                # TournamentTree + RunCursor for K-way merge
 │   ├── zstd_bundled/               # vendored zstd source (gitignored, downloaded on first build)
 │   └── sqlite_amalgamation/        # SQLite amalgamation (fallback if no system SQLite)
 ├── tests/
@@ -256,6 +258,71 @@ writer.write_rows(n, ids, tims_ids, num_peaks, max_ints, sum_ints);
 | `--scan-mode N` | 9 | ScanMode for all frames |
 | `--calib-params C0,..,C9` | (none) | 10 comma-separated floats |
 | `--dia-windows PATH` | (none) | mmappet replacing DiaFrameMsMsWindows |
+
+---
+
+## `mmappet-merge-dedup`
+
+Companion tool that converts the raw simulation output (unsorted, contains
+`ClusterID`) into a sorted, deduplicated mmappet suitable as input to `pmsms2tdf`.
+It replaces the two-step Python pipeline (`massimo-sort-precursors` +
+`massimo-deduplicate-precursors`) with a single multithreaded C++ pass.
+
+### Input / output
+
+**Input** — mmappet with columns `ClusterID frame scan tof intensity` (all uint32),
+as produced by `massimo_cpp`. Each contiguous block of equal `ClusterID` values is
+a sorted run (massimo_cpp sorts by (frame, scan, tof) within each cluster before
+writing).
+
+**Output** — mmappet with columns `frame scan tof intensity` (all uint32), globally
+sorted by (frame, scan, tof) and deduplicated. Events sharing the same triplet
+across different clusters are collapsed into one row with summed intensity.
+
+### Algorithm
+
+**K-way merge via tournament tree** (`src/loser_tree.h`):
+- `find_cluster_runs()` scans the `ClusterID` column once (O(N)) to find the
+  `[start, end)` boundaries of each of the K runs.
+- A `TournamentTree` (winner tree) merges all K sorted runs in O(N log K).
+- Adjacent identical (frame, scan, tof) triplets are accumulated and emitted as
+  one deduplicated row.
+
+**Multithreading — frame-range partitioning:**
+1. Global frame range `[global_min, global_max]` is determined from the per-run
+   min/max frames — O(K), not O(N).
+2. Frame space is divided into T non-overlapping ranges, one per thread.
+3. Each thread clips every cluster run to its frame range using two `lower_bound`
+   calls on the sorted frame column (O(K log(N/K)) per thread). A cluster whose
+   events span multiple ranges contributes a sub-cursor to each relevant thread;
+   clusters with no events in a range are skipped.
+4. Each thread builds its own `TournamentTree` over its clipped sub-cursors and
+   runs the merge + dedup loop, writing to a private temp directory.
+5. Main thread concatenates per-thread column files in order.
+
+Correctness: duplicate (frame, scan, tof) triplets share the same frame ID and
+therefore always land in the same thread — no cross-thread coordination needed.
+
+### CLI
+
+```
+./mmappet-merge-dedup <input.mmappet> <output.mmappet> [--threads N]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `input.mmappet` | (required) | Raw simulation output with ClusterID column |
+| `output.mmappet` | (required) | Sorted, deduplicated output |
+| `--threads N` | all hardware threads | Number of parallel merge threads |
+
+### Build & benchmark
+
+```bash
+make -C git/write_tdf mmappet-merge-dedup
+
+# On 98M-row dataset: ~3.7s wall (16 threads) vs 54s for the Python sort+dedup
+time ./mmappet-merge-dedup sim.mmappet dedup.mmappet
+```
 
 ---
 

@@ -111,6 +111,65 @@ that prints the merged event table to stdout instead of writing any files.
 
 ---
 
+---
+
+## `mmappet-merge-dedup`
+
+Pre-processing companion to `pmsms2tdf`. Converts the raw simulation output
+(unsorted, with a `ClusterID` column) into a sorted, deduplicated mmappet that
+`pmsms2tdf` can consume directly — replacing the two-step Python pipeline
+(`massimo-sort-precursors` + `massimo-deduplicate-precursors`) with a single
+multithreaded C++ pass.
+
+```
+sim.mmappet ──▶  mmappet-merge-dedup  ──▶  dedup.mmappet  ──▶  pmsms2tdf  ──▶  output.d/
+(ClusterID frame                           (frame scan
+ scan tof intensity)                        tof intensity)
+```
+
+### How it works
+
+The simulation writes events cluster by cluster, each cluster already sorted by
+(frame, scan, tof). `mmappet-merge-dedup` identifies the K cluster runs from the
+`ClusterID` column, then uses a **tournament tree** to merge all K sorted runs in
+O(N log K). Events with the same (frame, scan, tof) triplet — which can arise from
+overlapping clusters — are collapsed into one row with their intensities summed.
+
+**Multithreading**: the frame ID space is split into T non-overlapping ranges.
+Each thread clips every cluster run to its range via binary search, builds its own
+tournament tree, and writes to a temp directory. Because duplicate triplets share
+the same frame ID they always land in the same thread, so deduplication remains
+correct with no coordination between threads. The main thread concatenates results
+in frame order.
+
+### Build
+
+```bash
+make -C git/write_tdf mmappet-merge-dedup   # requires pthreads (system)
+```
+
+### Usage
+
+```bash
+./mmappet-merge-dedup <input.mmappet> <output.mmappet> [--threads N]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `input.mmappet` | (required) | Simulation output: `ClusterID frame scan tof intensity` |
+| `output.mmappet` | (required) | Sorted, deduplicated: `frame scan tof intensity` |
+| `--threads N` | all hardware threads | Parallel merge threads |
+
+### Performance (98M input rows, 16 cores)
+
+| Method | Time |
+|--------|------|
+| Python sort + dedup | 54 s |
+| `mmappet-merge-dedup` (1 thread) | 17 s |
+| `mmappet-merge-dedup` (16 threads) | 3.7 s |
+
+---
+
 ## Using the C++ headers
 
 The two core headers — `src/tdf_writer.h` and `src/mmappet.h` — can be used

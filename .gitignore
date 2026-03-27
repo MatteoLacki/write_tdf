@@ -12,3 +12,4 @@ pmsms2mzml
 # Ignore all files in tests/
 tests/*
 pmsms2tdf
+mmappet-merge-dedup
